@@ -30,7 +30,10 @@ from sglang.srt.mem_cache.subcontext.extend_plan import (
     source_slot_for_position,
     surviving_offsets,
 )
-from sglang.srt.mem_cache.subcontext.kv_materialize import materialize_reused_kv
+from sglang.srt.mem_cache.subcontext.kv_materialize import (
+    attention_backend_supports_subcontext_reuse,
+    materialize_reused_kv,
+)
 from sglang.srt.mem_cache.subcontext.subcontext_index import SubContextIndex, hash_token_span
 from sglang.srt.mem_cache.subcontext.subcontext_scanner import scan
 from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextEntry, SubContextTag
@@ -308,6 +311,32 @@ class TestExtendPlan(unittest.TestCase):
         self.assertEqual(result.materialize_source_slots.numel(), 0)
 
 
+class TestAttentionBackendSupportsSubcontextReuse(unittest.TestCase):
+    """Regression: FlashInfer's default ragged prefill fast path sizes the
+    KV context it reads off extend_prefix_lens alone (the literal radix
+    prefix), never the materialized reused span sitting in the gap between
+    it and the surviving suffix -- so a reused chunk's KV would silently
+    never be attended to. FlashAttention's extend path has no such split
+    (always sizes off the full seq_lens). This must stay a strict allowlist:
+    an unaudited or unrecognized backend defaults to unsupported, not to
+    trusted."""
+
+    def test_fa3_is_supported(self):
+        self.assertTrue(attention_backend_supports_subcontext_reuse("fa3"))
+
+    def test_flashinfer_requires_paged_mode(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(False):
+            self.assertFalse(attention_backend_supports_subcontext_reuse("flashinfer"))
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(True):
+            self.assertTrue(attention_backend_supports_subcontext_reuse("flashinfer"))
+
+    def test_unrecognized_backend_defaults_to_unsupported(self):
+        self.assertFalse(attention_backend_supports_subcontext_reuse("triton"))
+        self.assertFalse(attention_backend_supports_subcontext_reuse("torch_native"))
+
+
 class TestSubContextIndex(unittest.TestCase):
     def test_referenced_entry_survives_eviction_pressure(self):
         """A chunk locked by an in-flight request must not be evicted even
@@ -375,6 +404,25 @@ class TestScanner(unittest.TestCase):
 
         self.assertEqual(len(matches), 1)
         self.assertEqual((matches[0].query_start, matches[0].query_end), (11, 19))
+
+    def test_match_never_covers_the_requests_last_token(self):
+        """Regression: a match reaching the request's final token would
+        leave prepare_for_extend with zero surviving tokens for that
+        request -- no forward pass, no logits, no next-token sample.
+        _compute_max_prefix_len caps the ordinary prefix match at
+        input_len - 1 for exactly this reason; scan's `end` must give the
+        same guarantee for subcontext matches."""
+        index = SubContextIndex()
+        entry = _make_entry(range(0, 9))
+        index.register(entry)
+
+        query = list(range(0, 9))  # a 9-token match would exactly cover this whole query
+        matches = scan(index, query, end=len(query) - 1)
+        self.assertEqual(matches, [])
+
+        # One token shorter (end left open) does match, proving `end` is
+        # actually the reason for the miss above, not something else.
+        self.assertEqual(len(scan(index, query)), 1)
 
     def test_no_false_match_on_probe_collision_without_full_verify(self):
         """A candidate sharing only the probe-hash prefix but diverging

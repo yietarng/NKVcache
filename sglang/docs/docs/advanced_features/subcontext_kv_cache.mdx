@@ -203,7 +203,51 @@ pins this down for the batch-plan transform itself.
 `kv_materialize.find_rotary_embedding` and raises at startup if the model
 doesn't have exactly one shared instance (mixed RoPE bases, MLA, mrope,
 NoPE/ALiBi) -- the MVP's dense/standard-RoPE restriction is enforced, not
-just documented.
+just documented. It also checks
+`kv_materialize.attention_backend_supports_subcontext_reuse` against
+`model_runner.prefill_attention_backend_str` (see below) and raises if the
+configured backend isn't one of the two verified safe.
+
+## Attention-backend constraint: FlashInfer's ragged prefill path
+
+A review of this feature caught a real gap between "the KV pool has valid
+data at every logical position" and "the attention kernel actually reads
+it." FlashInfer's default prefill path (`layers/attention/flashinfer_backend.py`)
+splits attention into two passes when `use_ragged` is true (the default --
+`SGLANG_FLASHINFER_USE_PAGED` defaults to `False`, and `use_ragged` is only
+forced off by paged mode, determinism, or a tc_piecewise CUDA graph): a
+*ragged* self-attention pass among only this step's own query tokens
+(sized and read straight from the fresh K/V, no page table), plus a
+*paged* pass over the literal prefix, sized off `extend_prefix_lens` alone
+-- never off `seq_lens`. That's exactly right for ordinary prefix caching,
+where "this step's tokens" are always the request's full non-cached
+suffix. It's wrong here: with subcontext reuse, "this step's tokens" (the
+surviving positions) are a non-contiguous subset, and a reused span can
+sit in the gap between two surviving positions -- materialized into the KV
+pool, but never read by either pass, since the ragged pass never looks at
+the pool and the paged pass stops at `extend_prefix_lens`. The reused
+chunk would silently drop out of attention entirely.
+
+FlashAttention's extend path (`layers/attention/flashattention_backend.py`)
+has no such split: `cu_seqlens_k` / `page_table` are always built off the
+full `seq_lens` (via `req_to_token_pool`), with `extend_seq_lens` used only
+to size the query side. That is exactly the split this feature needs, and
+it's what `attention_backend_supports_subcontext_reuse` allowlists
+unconditionally. FlashInfer is allowlisted only when
+`SGLANG_FLASHINFER_USE_PAGED=1` forces its ragged path off. Every other
+backend (Triton, torch native, ...) is unaudited and therefore refused --
+this is a strict allowlist, not a denylist, on purpose.
+
+**Scan boundary.** A second issue from the same review: the scanner had no
+analogue of `Req._compute_max_prefix_len`'s `input_len - 1` cap, so a
+match could cover a request's very last token, leaving zero surviving
+tokens and no logit to sample from. `subcontext_scan` now takes an `end`
+parameter and `init_next_round_input` passes `input_len - 1`, exactly
+mirroring the ordinary prefix match's rule.
+
+**input_embeds requests** are also excluded from the eligibility gate in
+`prepare_for_extend`: their own `input_embeds` slicing assumes the full
+extend range, which a gathered/shrunk `input_ids` would silently mismatch.
 
 ## File list
 

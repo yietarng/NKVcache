@@ -55,13 +55,23 @@ def surviving_offsets(
     """Absolute positions in ``[extend_start, extend_end)`` that still need
     a real forward pass: the glue between matches, plus each match's
     selectively-recomputed offsets (already excluded from
-    ``reused_ranges``)."""
-    reused_positions = set()
+    ``reused_ranges``).
+
+    ``reused_ranges`` (as ``reused_ranges_within`` produces them) are
+    sorted by start and pairwise disjoint -- matches never overlap, and a
+    plan's own reused_ranges() only carves up its own match's span -- so a
+    single sorted walk suffices; no need to materialize every reused
+    position into a set first.
+    """
+    survive: List[int] = []
+    cursor = extend_start
     for start, end, _match in reused_ranges:
-        reused_positions.update(range(start, end))
-    return [
-        pos for pos in range(extend_start, extend_end) if pos not in reused_positions
-    ]
+        if start > cursor:
+            survive.extend(range(cursor, start))
+        cursor = max(cursor, end)
+    if cursor < extend_end:
+        survive.extend(range(cursor, extend_end))
+    return survive
 
 
 def source_slot_for_position(match: SubContextMatch, position: int) -> int:

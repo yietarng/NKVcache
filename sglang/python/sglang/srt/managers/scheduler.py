@@ -284,7 +284,10 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
-from sglang.srt.mem_cache.subcontext.kv_materialize import find_rotary_embedding
+from sglang.srt.mem_cache.subcontext.kv_materialize import (
+    attention_backend_supports_subcontext_reuse,
+    find_rotary_embedding,
+)
 from sglang.srt.mem_cache.subcontext.subcontext_index import SubContextIndex
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -1690,8 +1693,10 @@ class Scheduler(
     def maybe_init_subcontext_index(self) -> None:
         """--enable-subcontext-kv-cache: a content-addressed index of
         reusable sub-contexts (see mem_cache/subcontext/). MVP scope is
-        dense, standard-RoPE models only -- fail fast at startup rather
-        than silently no-op or corrupt output on an unsupported model."""
+        dense, standard-RoPE models on an attention backend that reads the
+        full per-request KV context off seq_lens (not FlashInfer's default
+        ragged/paged split) -- fail fast at startup rather than silently
+        no-op or corrupt output on an unsupported model or backend."""
         self.subcontext_index = None
         if not get_memory().enable_subcontext_kv_cache:
             return
@@ -1701,6 +1706,15 @@ class Scheduler(
                 "one shared RotaryEmbedding module (dense, standard-RoPE "
                 "models only); this model doesn't have one. See "
                 "docs/docs/advanced_features/subcontext_kv_cache.mdx."
+            )
+        backend = self.tp_worker.model_runner.prefill_attention_backend_str
+        if not attention_backend_supports_subcontext_reuse(backend):
+            raise ValueError(
+                f"--enable-subcontext-kv-cache does not support the "
+                f"'{backend}' prefill attention backend. Use --attention-"
+                f"backend fa3, or flashinfer with SGLANG_FLASHINFER_USE_PAGED=1 "
+                f"to disable its ragged prefill fast path. See "
+                f"docs/docs/advanced_features/subcontext_kv_cache.mdx."
             )
         self.subcontext_index = SubContextIndex()
 

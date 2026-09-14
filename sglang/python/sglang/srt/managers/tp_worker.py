@@ -620,7 +620,8 @@ class TpModelWorker(BaseTpWorker):
             # ModelRunner.forward. See mem_cache/subcontext/kv_materialize.py.
             if batch.subcontext_materialize_plan is not None:
                 materialize_reused_kv_for_batch(
-                    model_runner=self.model_runner,
+                    model=self.model_runner.model,
+                    token_to_kv_pool=self.model_runner.token_to_kv_pool,
                     plan=batch.subcontext_materialize_plan,
                 )
         else:

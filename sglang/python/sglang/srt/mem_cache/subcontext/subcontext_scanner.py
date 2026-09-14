@@ -14,7 +14,7 @@ matches, combined:
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from sglang.srt.mem_cache.subcontext.subcontext_index import (
     PROBE_LEN,
@@ -61,7 +61,7 @@ def _match_explicit_tags(
 
 
 def _longest_candidate_match(
-    index: SubContextIndex, token_ids: Sequence[int], pos: int
+    index: SubContextIndex, token_ids: Sequence[int], pos: int, max_end: int
 ) -> SubContextMatch | None:
     probe = probe_hash(token_ids, pos)
     if probe is None:
@@ -69,6 +69,8 @@ def _longest_candidate_match(
     best: SubContextEntry | None = None
     for candidate in index.candidates_for_probe(probe):
         if candidate.length <= (best.length if best else -1):
+            continue
+        if pos + candidate.length > max_end:
             continue
         if _verify_full_match(candidate, token_ids, pos):
             best = candidate
@@ -85,8 +87,10 @@ def scan(
     *,
     explicit_tags: Sequence[SubContextTag] = (),
     start: int = 0,
+    end: Optional[int] = None,
 ) -> List[SubContextMatch]:
-    """Non-overlapping matches over ``token_ids[start:]``, sorted by query_start.
+    """Non-overlapping matches over ``token_ids[start:end]``, sorted by
+    query_start.
 
     Explicit tags take priority over their span; automatic scanning fills
     in the rest, greedily preferring the longest verified match at each
@@ -94,24 +98,32 @@ def scan(
     share a prefix. ``start`` excludes the region a caller already resolved
     some other way (e.g. the ordinary prefix-radix match, which is strictly
     cheaper reuse than a repositioned sub-context and always wins there).
+    ``end`` (default ``len(token_ids)``) caps how far a match may reach --
+    the caller must leave at least the request's own last token out of
+    ``end`` (mirroring ``Req._compute_max_prefix_len``'s ``input_len - 1``
+    rule for the ordinary prefix match): a match is never allowed to cover
+    every token, or the request would have no token left to compute a
+    logit and sample from.
     """
     n = len(token_ids)
+    if end is None:
+        end = n
     covered = bytearray(n)
     matches: List[SubContextMatch] = []
 
     for match in _match_explicit_tags(index, token_ids, explicit_tags):
-        if match.query_start < start:
+        if match.query_start < start or match.query_end > end:
             continue
         for i in range(match.query_start, match.query_end):
             covered[i] = 1
         matches.append(match)
 
     pos = start
-    while pos <= n - PROBE_LEN:
+    while pos <= end - PROBE_LEN:
         if covered[pos]:
             pos += 1
             continue
-        found = _longest_candidate_match(index, token_ids, pos)
+        found = _longest_candidate_match(index, token_ids, pos, end)
         if found is None:
             pos += 1
             continue

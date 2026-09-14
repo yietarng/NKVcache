@@ -1631,11 +1631,14 @@ class Req(ReqDllmMixin):
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
-            # NOTE: this resolves *which* spans of the unmatched suffix are
+            # NOTE: resolves *which* spans of the unmatched suffix are
             # reusable sub-contexts and how much of each to selectively
-            # recompute; it does not yet change what gets fed to the model.
-            # See docs/docs/advanced_features/subcontext_kv_cache.mdx for the
-            # batch-construction consumer this plan is designed for.
+            # recompute; managers/schedule_batch.py: prepare_for_extend is
+            # the consumer that turns this into a shrunk forward pass. Capped
+            # to input_len - 1, mirroring _compute_max_prefix_len's rule for
+            # the ordinary prefix match: a match must never cover the
+            # request's last token, or there would be nothing left to
+            # compute a logit and sample from.
             if (
                 subcontext_index is not None
                 and self.positional_embed_overrides is None
@@ -1654,6 +1657,7 @@ class Req(ReqDllmMixin):
                     token_ids_to_match,
                     explicit_tags=tags,
                     start=len(self.prefix_indices),
+                    end=input_len - 1,
                 )
                 self.subcontext_matches = matches
                 self.subcontext_recompute_plans = [
@@ -2715,8 +2719,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # when a SubContextIndex was passed into init_next_round_input,
         # which only happens with --enable-subcontext-kv-cache. Excluded
         # here rather than left to fall out naturally: multimodal,
-        # positional-embed overrides, logprobs, DLLM, and the mamba extra
-        # buffer, none of which this bookkeeping accounts for.
+        # positional-embed overrides, input_embeds (its own slicing below
+        # assumes the full extend range, not a gathered subset), logprobs,
+        # DLLM, and the mamba extra buffer, none of which this bookkeeping
+        # accounts for.
         subcontext_eligible_batch = (
             not self.return_logprob
             and not self.is_dllm()
@@ -2729,6 +2735,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and r.subcontext_recompute_plans
                 and r.multimodal_inputs is None
                 and r.positional_embed_overrides is None
+                and r.input_embeds is None
             ):
                 subcontext_request_plans.append(
                     plan_request_extend(

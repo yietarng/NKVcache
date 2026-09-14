@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.reposition import reposition_key
 
@@ -26,7 +27,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.subcontext.subcontext_types import (
         SubcontextMaterializePlan,
     )
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 def find_rotary_embedding(model: torch.nn.Module) -> Optional[RotaryEmbedding]:
@@ -100,14 +100,46 @@ def materialize_reused_kv(
         v_buffer.index_copy_(0, dest_slots, src_v)
 
 
+def attention_backend_supports_subcontext_reuse(backend_str: str) -> bool:
+    """Whether ``backend_str`` reads the KV context for a query token from
+    the full per-request page table (``req_to_token_pool``, sized off
+    ``seq_lens``) rather than splitting it into a "ragged" self-attention
+    pass over just this step's own query tokens plus a separately-sized
+    "paged" pass over the literal prefix.
+
+    That split (FlashInfer's ``use_ragged`` fast path, on by default:
+    ``flashinfer_backend.py``'s ``update_single_wrapper``/``update`` size
+    the paged half off ``extend_prefix_lens`` alone) assumes a request's
+    forward-pass tokens are exactly its non-cached suffix -- true for
+    ordinary prefix caching, false here, where the "new" tokens can be a
+    non-contiguous subset with a subcontext-reused span sitting in a gap
+    the ragged pass never reads. FlashAttention's extend path has no such
+    split: ``flashattention_backend.py`` always sizes ``cu_seqlens_k`` /
+    ``page_table`` off the full ``seq_lens``, using ``extend_seq_lens``
+    only for the query side, so it's unconditionally safe. FlashInfer is
+    only safe with its ragged path forced off
+    (``SGLANG_FLASHINFER_USE_PAGED=1``).
+    """
+    if backend_str == "fa3":
+        return True
+    if backend_str == "flashinfer":
+        return envs.SGLANG_FLASHINFER_USE_PAGED.get()
+    return False
+
+
 def materialize_reused_kv_for_batch(
     *,
-    model_runner: "ModelRunner",
+    model: torch.nn.Module,
+    token_to_kv_pool: "KVCache",
     plan: "SubcontextMaterializePlan",
 ) -> None:
     """Convenience wrapper for ``managers/tp_worker.py``: resolves the
     model's rotary embedding and the KV pool's layer range, then
-    materializes every layer's reused K/V for one batch's plan.
+    materializes every layer's reused K/V for one batch's plan. Takes the
+    model and pool directly rather than a whole ``ModelRunner`` -- they're
+    the only two things this needs (see
+    ``.claude/rules/general-code-style.md``: "pass what you need, not the
+    god object").
 
     Raises rather than silently skipping if the model has no single shared
     RotaryEmbedding (mixed RoPE bases, or a position-independent attention
@@ -118,20 +150,19 @@ def materialize_reused_kv_for_batch(
     of reached here -- see the MVP scope note in
     ``docs/docs/advanced_features/subcontext_kv_cache.mdx``.
     """
-    rotary_emb = find_rotary_embedding(model_runner.model)
+    rotary_emb = find_rotary_embedding(model)
     if rotary_emb is None:
         raise RuntimeError(
             "Sub-context KV reuse matched a request but the model has no "
             "single shared RotaryEmbedding module; unsupported by the "
             "current MVP scope (dense, standard-RoPE models only)."
         )
-    pool = model_runner.token_to_kv_pool
     inv_freq = rotary_emb._compute_inv_freq(rotary_emb.base).to(
         device=plan.source_slots.device, dtype=torch.float32
     )
     materialize_reused_kv(
-        token_to_kv_pool=pool,
-        layer_ids=range(pool.start_layer, pool.end_layer + 1),
+        token_to_kv_pool=token_to_kv_pool,
+        layer_ids=range(token_to_kv_pool.start_layer, token_to_kv_pool.end_layer + 1),
         source_slots=plan.source_slots,
         dest_slots=plan.dest_slots,
         delta_positions=plan.delta_positions,
