@@ -10,9 +10,10 @@ corrected for its new position.
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple
+from typing import Literal, NamedTuple, Optional, Tuple
 
 import msgspec
+import torch
 
 
 class SubContextTag(msgspec.Struct, frozen=True, kw_only=True):
@@ -91,3 +92,15 @@ class RecomputePlan(msgspec.Struct, frozen=True, kw_only=True):
         if start is not None:
             ranges.append((start, self.match.query_end))
         return tuple(ranges)
+
+
+class SubcontextMaterializePlan(NamedTuple):
+    """Batch-flattened work list for ``kv_materialize.materialize_reused_kv``:
+    for every layer, copy+reposition K and copy V from ``source_slots`` into
+    ``dest_slots`` by ``delta_positions``. Set on ``ScheduleBatch`` by
+    ``prepare_for_extend``, consumed by ``managers/tp_worker.py`` right
+    before the model forward."""
+
+    source_slots: torch.Tensor
+    dest_slots: torch.Tensor
+    delta_positions: torch.Tensor

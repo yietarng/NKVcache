@@ -19,7 +19,18 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.reposition import reposition_key
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-from sglang.srt.mem_cache.subcontext.deviation_recompute import plan_prefix_fraction
+from sglang.srt.mem_cache.subcontext.deviation_recompute import (
+    plan_none,
+    plan_prefix_fraction,
+)
+from sglang.srt.mem_cache.subcontext.extend_plan import (
+    build_batch_subcontext_plan,
+    plan_request_extend,
+    reused_ranges_within,
+    source_slot_for_position,
+    surviving_offsets,
+)
+from sglang.srt.mem_cache.subcontext.kv_materialize import materialize_reused_kv
 from sglang.srt.mem_cache.subcontext.subcontext_index import SubContextIndex, hash_token_span
 from sglang.srt.mem_cache.subcontext.subcontext_scanner import scan
 from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextEntry, SubContextTag
@@ -77,6 +88,224 @@ class TestRepositionMath(unittest.TestCase):
             k, delta_positions=torch.zeros(5), inv_freq=inv_freq, is_neox_style=True
         )
         torch.testing.assert_close(out, k, atol=1e-5, rtol=1e-5)
+
+
+class _FakePool:
+    """Minimal KVCache double: one [pool_size, num_kv_heads, head_dim]
+    tensor per layer, exposing exactly the two accessors
+    materialize_reused_kv uses."""
+
+    def __init__(self, num_layers, pool_size, num_kv_heads, head_dim):
+        self.k = [torch.randn(pool_size, num_kv_heads, head_dim) for _ in range(num_layers)]
+        self.v = [torch.randn(pool_size, num_kv_heads, head_dim) for _ in range(num_layers)]
+
+    def get_key_buffer(self, layer_id):
+        return self.k[layer_id]
+
+    def get_value_buffer(self, layer_id):
+        return self.v[layer_id]
+
+
+class TestMaterializeReusedKv(unittest.TestCase):
+    def test_materialized_k_matches_direct_rotation_and_v_is_copied(self):
+        """End-to-end (minus the real model): the slots a request lands on
+        after materialization must hold exactly what full recomputation at
+        the new position would have produced for K, and an untouched copy
+        for V -- the whole point of the mechanism is that this substitutes
+        for recomputation losslessly."""
+        torch.manual_seed(0)
+        num_layers, pool_size, num_heads, head_dim = 3, 64, 4, 32
+        pool = _FakePool(num_layers, pool_size, num_heads, head_dim)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+
+        source_slots = torch.tensor([5, 6, 7])
+        dest_slots = torch.tensor([40, 41, 42])
+        orig_positions = torch.tensor([5.0, 6.0, 7.0])
+        new_positions = torch.tensor([100.0, 101.0, 102.0])
+        delta = new_positions - orig_positions
+
+        expected_k = [pool.get_key_buffer(l).index_select(0, source_slots).clone() for l in range(num_layers)]
+        expected_v = [pool.get_value_buffer(l).index_select(0, source_slots).clone() for l in range(num_layers)]
+
+        materialize_reused_kv(
+            token_to_kv_pool=pool,
+            layer_ids=range(num_layers),
+            source_slots=source_slots,
+            dest_slots=dest_slots,
+            delta_positions=delta,
+            inv_freq=inv_freq,
+            is_neox_style=True,
+            rotary_dim=head_dim,
+        )
+
+        for l in range(num_layers):
+            got_k = pool.get_key_buffer(l).index_select(0, dest_slots)
+            want_k = reposition_key(
+                expected_k[l], delta_positions=delta, inv_freq=inv_freq, is_neox_style=True
+            )
+            torch.testing.assert_close(got_k, want_k, atol=1e-5, rtol=1e-5)
+
+            got_v = pool.get_value_buffer(l).index_select(0, dest_slots)
+            torch.testing.assert_close(got_v, expected_v[l])
+
+    def test_partial_rotary_leaves_pass_through_dims_untouched(self):
+        """Only the leading rotary_dim channels of K may change; the
+        pass-through tail must be a byte-for-byte copy, same as V."""
+        torch.manual_seed(1)
+        head_dim, rotary_dim = 32, 16
+        pool = _FakePool(1, 16, 2, head_dim)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+
+        source_slots = torch.tensor([0])
+        dest_slots = torch.tensor([10])
+        expected_pass_through = pool.get_key_buffer(0)[0, :, rotary_dim:].clone()
+
+        materialize_reused_kv(
+            token_to_kv_pool=pool,
+            layer_ids=[0],
+            source_slots=source_slots,
+            dest_slots=dest_slots,
+            delta_positions=torch.tensor([7.0]),
+            inv_freq=inv_freq,
+            is_neox_style=True,
+            rotary_dim=rotary_dim,
+        )
+
+        got_pass_through = pool.get_key_buffer(0)[10, :, rotary_dim:]
+        torch.testing.assert_close(got_pass_through, expected_pass_through)
+
+
+class TestExtendPlan(unittest.TestCase):
+    def _match(self, start, end, orig_position=0):
+        from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
+
+        entry = _make_entry(range(0, end - start), orig_position=orig_position)
+        return SubContextMatch(entry=entry, query_start=start, query_end=end, source="scanned")
+
+    def test_match_split_across_chunk_boundary_is_dropped(self):
+        """A match only partly inside this round's extend range must be
+        fully dropped (computed normally), not partially materialized --
+        chunked prefill would otherwise reuse KV for tokens this chunk
+        never actually allocated slots for."""
+        plan = plan_none(self._match(10, 30))  # extends past extend_end=20
+        ranges = reused_ranges_within([plan], extend_start=0, extend_end=20)
+        self.assertEqual(ranges, [])
+
+    def test_fully_covered_match_is_kept(self):
+        plan = plan_none(self._match(10, 20))
+        ranges = reused_ranges_within([plan], extend_start=0, extend_end=20)
+        self.assertEqual(len(ranges), 1)
+        self.assertEqual(ranges[0][:2], (10, 20))
+
+    def test_surviving_offsets_is_the_complement_of_reused_ranges(self):
+        """Derived property: surviving + reused must partition
+        [extend_start, extend_end) exactly, with no overlap and no gap --
+        get this wrong and a token either never gets computed (garbage
+        output) or gets computed twice (wasted, but silently so)."""
+        m = self._match(2, 5)
+        reused = [(2, 5, m), (8, 9, m)]
+        survive = surviving_offsets(reused, extend_start=0, extend_end=10)
+        self.assertEqual(survive, [0, 1, 5, 6, 7, 9])
+
+        reused_flat = set()
+        for s, e, _m in reused:
+            reused_flat.update(range(s, e))
+        self.assertEqual(set(survive) | reused_flat, set(range(0, 10)))
+        self.assertEqual(set(survive) & reused_flat, set())
+
+    def test_source_slot_for_position_indexes_from_match_start(self):
+        m = self._match(10, 15)  # entry.slots = (0, 1, 2, 3, 4)
+        self.assertEqual(source_slot_for_position(m, 10), 0)
+        self.assertEqual(source_slot_for_position(m, 13), 3)
+
+    def test_plan_request_extend_partitions_the_full_local_range(self):
+        """Derived property: surviving_local + reused_local must equal
+        exactly {0, ..., extend_len-1} with no overlap -- this is what
+        lets the caller split one flat out_cache_loc slice by these index
+        sets and use every physical slot exactly once."""
+        prefix_len, extend_len = 100, 20
+        # Match covers absolute [105, 112) i.e. local [5, 12); orig_position=0
+        # so delta_position = 105 - 0 = 105.
+        entry = _make_entry(range(0, 7), orig_position=0)
+        from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
+
+        match = SubContextMatch(entry=entry, query_start=105, query_end=112, source="scanned")
+        plan = plan_request_extend(
+            [plan_none(match)], prefix_len=prefix_len, extend_len=extend_len
+        )
+
+        self.assertEqual(plan.reused_local, tuple(range(5, 12)))
+        self.assertEqual(
+            set(plan.surviving_local) | set(plan.reused_local), set(range(extend_len))
+        )
+        self.assertEqual(set(plan.surviving_local) & set(plan.reused_local), set())
+        self.assertEqual(plan.reused_source_slots, entry.slots)
+        self.assertEqual(plan.reused_delta_positions, (105.0,) * 7)
+        self.assertEqual(
+            plan.surviving_absolute, tuple(prefix_len + o for o in plan.surviving_local)
+        )
+
+    def test_plan_request_extend_with_no_matches_keeps_everything_surviving(self):
+        prefix_len, extend_len = 5, 10
+        plan = plan_request_extend([], prefix_len=prefix_len, extend_len=extend_len)
+        self.assertEqual(plan.surviving_local, tuple(range(extend_len)))
+        self.assertEqual(plan.reused_local, ())
+
+    def test_build_batch_subcontext_plan_mixed_batch(self):
+        """A request with no plan (feature off / ineligible / no match)
+        must come through byte-identical to today's contiguous slice; a
+        request with a plan must have its out_cache_loc narrowed to
+        exactly its surviving slots, its extend_len shrunk to match, and
+        its reused slots + deltas collected for the materializer -- this
+        is the exact transform prepare_for_extend applies to the whole
+        batch's already-allocated out_cache_loc."""
+        from sglang.srt.mem_cache.subcontext.extend_plan import RequestSubcontextPlan
+
+        out_cache_loc = torch.tensor([100, 101, 102, 200, 201, 202, 203, 204])
+        prefix_lens = [0, 50]
+        extend_lens = [3, 5]
+        req1_plan = RequestSubcontextPlan(
+            surviving_absolute=(50, 53, 54),
+            surviving_local=(0, 3, 4),
+            reused_local=(1, 2),
+            reused_source_slots=(10, 11),
+            reused_delta_positions=(40.0, 40.0),
+        )
+
+        result = build_batch_subcontext_plan(
+            request_plans=[None, req1_plan],
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            out_cache_loc=out_cache_loc,
+        )
+
+        torch.testing.assert_close(
+            result.out_cache_loc, torch.tensor([100, 101, 102, 200, 203, 204])
+        )
+        self.assertEqual(result.extend_lens, [3, 3])
+        torch.testing.assert_close(result.positions, torch.tensor([0, 1, 2, 50, 53, 54]))
+        torch.testing.assert_close(result.materialize_dest_slots, torch.tensor([201, 202]))
+        torch.testing.assert_close(result.materialize_source_slots, torch.tensor([10, 11]))
+        torch.testing.assert_close(
+            result.materialize_delta_positions, torch.tensor([40.0, 40.0])
+        )
+
+    def test_build_batch_subcontext_plan_all_passthrough_matches_original(self):
+        """No plans active (the common case: feature off, or on but no
+        request in this batch matched anything) must reproduce the
+        original out_cache_loc and a plain arange positions tensor
+        exactly -- this is the zero-overhead-when-idle guarantee."""
+        out_cache_loc = torch.tensor([5, 6, 7, 8, 9])
+        result = build_batch_subcontext_plan(
+            request_plans=[None, None],
+            prefix_lens=[0, 3],
+            extend_lens=[3, 2],
+            out_cache_loc=out_cache_loc,
+        )
+        torch.testing.assert_close(result.out_cache_loc, out_cache_loc)
+        self.assertEqual(result.extend_lens, [3, 2])
+        torch.testing.assert_close(result.positions, torch.tensor([0, 1, 2, 3, 4]))
+        self.assertEqual(result.materialize_source_slots.numel(), 0)
 
 
 class TestSubContextIndex(unittest.TestCase):

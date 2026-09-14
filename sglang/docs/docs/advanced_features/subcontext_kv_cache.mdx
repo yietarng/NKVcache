@@ -14,9 +14,11 @@ position instead of recomputing it.
 
 ## Status
 
-This document describes the full design. What's implemented and tested
-without a GPU, and what still needs GPU validation, is called out per
-section below -- see "Implementation status" at the end for the summary.
+The full mechanism described here is implemented, including the path that
+excludes reused tokens from the live forward pass (previously a spec-only
+section of this doc). What's verified without a GPU, and what still needs
+GPU validation before production use, is called out per section below --
+see "Implementation status" at the end for the summary.
 
 ## Algorithm
 
@@ -127,51 +129,81 @@ CPU dependency chain resolved and exercised in this repo's sandbox,
 without GPU/CUDA) -- the wiring is syntactically and structurally sound
 end to end from the HTTP request field down to the per-request match plan.
 
-## What's specified but not yet wired (needs GPU validation)
+## How reused tokens are excluded from the live forward pass
 
-Populating `req.subcontext_matches` does not yet change what gets fed to
-the model -- that's the part with no CPU-only way to validate against a
-real attention kernel, so it's left as a precise integration spec rather
-than an unverified patch to hot, frozen serving code
-(`model_executor/model_runner.py` is explicitly frozen;
-`managers/tp_worker.py` and the `ForwardBatch` construction path are
-extremely purity-constrained -- see `.claude/rules/`). Two things need to
-happen, in order, for a batch containing subcontext-matched requests:
+This is the mechanism that makes the feature actually save compute rather
+than just relabel it -- prefix caching already skips the full per-layer
+forward (not just the attention math) for cached tokens, and this
+generalizes that to non-leading spans. Two things happen, in order, for a
+batch containing subcontext-matched requests:
 
-1. **Materialize reused KV before the model forward.** For each match's
-   *reused* ranges (`RecomputePlan.reused_ranges()` -- the match span minus
-   recomputed offsets), for every transformer layer: read the source
-   chunk's K/V from `MHATokenToKVPool.get_key_buffer(layer_id)` /
-   `get_value_buffer(layer_id)` at `entry.slots`, apply
-   `reposition_key(..., delta_positions=match.delta_position)` to K (V
-   unchanged), and write both into freshly allocated physical slots for
-   *this* request via `set_kv_buffer(layer, loc_info, cache_k, cache_v)`.
-   This is pure data movement across all layers at once -- no model
-   forward involved -- so it belongs in `TpModelWorker.forward_batch_generation`
-   (`managers/tp_worker.py`), right after `ForwardBatch.init_new(...)` and
-   before `self.model_runner.forward(...)`. `model_runner.py` itself does
-   not need to change.
-2. **Exclude pure-reuse tokens from the forward pass.** The materialized
-   tokens must not be re-run through the model (that's the entire point --
-   skipping the full per-layer forward, not just the attention math, is
-   what prefix caching already saves, and this generalizes it to
-   non-leading spans). Building `input_ids` / `positions` as a *gather*
-   over the surviving positions (glue tokens plus each match's
-   selectively-recomputed offsets) instead of the current contiguous
-   `arange(prefix_len, seq_len)` (`model_executor/forward_batch_info.py:
-   compute_position`) is the generalization prefix caching already makes
-   for one leading span; it needs to admit several interior spans.
-   `req_to_token_pool`'s row must place the materialized slots (step 1) at
-   their true logical offsets and the model-forward-written slots at
-   theirs, so existing attention backends need no change -- they already
-   attend over the full row up to `seq_len` regardless of which step wrote
-   which slot.
+1. **Materialize reused KV before the model forward.**
+   `ScheduleBatch.prepare_for_extend` (`managers/schedule_batch.py`) computes,
+   per eligible request, a `RequestSubcontextPlan`
+   (`mem_cache/subcontext/extend_plan.py: plan_request_extend`) splitting its
+   extend range into `surviving_local` offsets (need a real forward pass)
+   and `reused_local` offsets (materialized instead), then
+   `build_batch_subcontext_plan` applies that split to the batch's
+   already-allocated `out_cache_loc` (allocation itself is untouched --
+   sized off the *full* logical range, since every position needs a slot
+   either way) and collects a flat `SubcontextMaterializePlan`
+   (source slot, dest slot, delta position per reused token) onto
+   `batch.subcontext_materialize_plan`. `managers/tp_worker.py:
+   forward_batch_generation` calls
+   `kv_materialize.materialize_reused_kv_for_batch` with it right after
+   `ForwardBatch.init_new(...)` and before `self.model_runner.forward(...)`:
+   for every layer, gather the source chunk's K/V via
+   `KVCache.get_key_buffer(layer_id)` / `get_value_buffer(layer_id)`,
+   reposition K (`layers/rotary_embedding/reposition.py`), and
+   `index_copy_` both into the destination slots. Pure data movement, no
+   model forward involved, so `model_executor/model_runner.py` (frozen)
+   does not change.
+2. **Exclude those tokens from the forward pass.** In the same
+   `prepare_for_extend` pass, `input_ids` becomes a *gather* over each
+   eligible request's `surviving_absolute` positions instead of the plain
+   `fill_ids[prefix_len:]` slice, and `extend_lens` /
+   `extend_num_tokens` are rebound to the surviving-token counts
+   (allocation already happened off the full counts, so this rebind is
+   safe). `batch.subcontext_positions` carries the true logical positions
+   for those surviving tokens; `ForwardBatch.init_new`
+   (`model_executor/forward_batch_info.py`) overrides `ret.positions` with
+   it in the same branch that already handles DLLM/spec-info position
+   overrides, ahead of the default `compute_position()` arange (which
+   still runs, correctly sized off the now-consistent `extend_lens`, but
+   is simply discarded). `req_to_token_pool`'s row for each request already
+   holds every logical position's slot after allocation regardless of
+   which step (materializer or live forward) later fills it, so existing
+   attention backends need no change -- they already attend over the full
+   row up to `seq_len` (confirmed against `flashattention_backend.py`,
+   which derives `cu_seqlens_q` from `extend_seq_lens` and the KV context
+   length separately from `seq_lens`, exactly the split this needs).
 
-This is a bigger, well-scoped follow-up (touches `ForwardBatch.init_new`'s
-purity contract and the extend-batch prep in `schedule_batch.py`) rather
-than a gap in the design: the mechanism above is exact given the
-MVP scope's constraints (standard RoPE, no partial forward paths from
-CUDA graphs to route around).
+**Eligibility gate.** `prepare_for_extend` only takes this path for a
+request with a non-empty `subcontext_recompute_plans`, no multimodal
+inputs, no positional-embed overrides, and only when the whole batch has
+`return_logprob=False`, isn't DLLM, and isn't running the mamba extra
+buffer -- deliberately conservative so the untouched path (unaffected by
+any of this) is guaranteed to run for anything the accounting above
+doesn't cover. Below the request level, `reused_ranges_within` also drops
+any match that isn't *entirely* inside the current extend range, so a
+match split across a chunked-prefill boundary is just computed normally
+rather than partially materialized.
+
+**Zero-overhead-when-idle.** Every new code path in `prepare_for_extend` is
+gated behind `subcontext_active = any(plan is not None for plan in
+subcontext_request_plans)`, itself impossible to be `True` unless a
+`SubContextIndex` was constructed (`--enable-subcontext-kv-cache`) *and* a
+request actually matched something. Feature off, or on with nothing yet
+recurring, is byte-for-byte the pre-existing code path --
+`test_build_batch_subcontext_plan_all_passthrough_matches_original`
+pins this down for the batch-plan transform itself.
+
+**Startup validation.** `Scheduler.maybe_init_subcontext_index`
+(`managers/scheduler.py`) resolves the loaded model's `RotaryEmbedding` via
+`kv_materialize.find_rotary_embedding` and raises at startup if the model
+doesn't have exactly one shared instance (mixed RoPE bases, MLA, mrope,
+NoPE/ALiBi) -- the MVP's dense/standard-RoPE restriction is enforced, not
+just documented.
 
 ## File list
 
@@ -181,15 +213,30 @@ New:
 - `python/sglang/srt/mem_cache/subcontext/subcontext_index.py`
 - `python/sglang/srt/mem_cache/subcontext/subcontext_scanner.py`
 - `python/sglang/srt/mem_cache/subcontext/deviation_recompute.py`
+- `python/sglang/srt/mem_cache/subcontext/extend_plan.py` -- per-request and
+  per-batch plan builders consumed by `prepare_for_extend`.
+- `python/sglang/srt/mem_cache/subcontext/kv_materialize.py` -- the
+  materializer, `find_rotary_embedding`, and the `tp_worker.py` call-site
+  wrapper.
 - `python/sglang/srt/layers/rotary_embedding/reposition.py`
 - `test/registered/unit/mem_cache/test_subcontext_cache.py`
 
 Modified:
 - `python/sglang/srt/managers/schedule_batch.py` -- `Req.subcontext_tags` /
   `subcontext_matches` / `subcontext_recompute_plans`;
-  `init_next_round_input` scan wiring.
+  `init_next_round_input` scan wiring; `ScheduleBatch.subcontext_positions` /
+  `subcontext_materialize_plan` fields; the eligibility gate, gathered
+  `input_ids`, and `out_cache_loc`/`extend_lens` rewrite in
+  `prepare_for_extend`.
 - `python/sglang/srt/managers/scheduler.py` -- pass `recv_req.subcontext_tags`
-  into `Req(...)`.
+  into `Req(...)`; `Scheduler.maybe_init_subcontext_index` (constructs and
+  validates the index at startup); thread `self.subcontext_index` into the
+  main prefill admission's `init_next_round_input` call.
+- `python/sglang/srt/managers/tp_worker.py` -- the
+  `materialize_reused_kv_for_batch` call site in
+  `forward_batch_generation`, right after `ForwardBatch.init_new`.
+- `python/sglang/srt/model_executor/forward_batch_info.py` -- the
+  `batch.subcontext_positions` override branch in `ForwardBatch.init_new`.
 - `python/sglang/srt/managers/io_struct.py` -- `GenerateReqInput.subcontext_tags`,
   `TokenizedGenerateReqInput.subcontext_tags`.
 - `python/sglang/srt/managers/tokenizer_manager.py` -- propagate
@@ -198,7 +245,20 @@ Modified:
   `enable_subcontext_kv_cache`, `subcontext_recompute_ratio`.
 - `python/sglang/srt/arg_groups/fields/memory.py` -- the two CLI flags.
 
-Not yet touched (see "What's specified but not yet wired"):
-- `python/sglang/srt/managers/tp_worker.py` -- KV materialization call site.
-- `python/sglang/srt/model_executor/forward_batch_info.py` -- gathered
-  `input_ids`/`positions` construction for matched requests.
+## What still needs GPU validation
+
+Every module above is either pure-CPU tested (index, scanner, rotation
+math, materializer against a fake pool, the batch-plan transform) or
+import/syntax verified end-to-end (this repo's real dependency chain,
+resolved in a CPU-only sandbox, imports `schedule_batch.py`, `scheduler.py`,
+`tp_worker.py`, `forward_batch_info.py`, `tokenizer_manager.py`, and
+`server_args.py` cleanly with these changes). What that cannot cover: an
+actual forward pass on a real dense model, confirming the attention
+backend's `cu_seqlens_q`/context-length split behaves as analyzed under
+`extend_seq_lens[i] != seq_lens[i] - prefix_lens[i]` -- the first time this
+codebase produces that inequality for a plain (non-chunked, non-retracted)
+extend batch. Recommended smoke test before any real traffic: a small
+Llama-style model, a handful of requests that share an explicitly-tagged
+sub-context at different offsets, `--subcontext-recompute-ratio 0` (pure
+reuse, easiest to reason about), comparing output logits against the same
+prompts run without `--enable-subcontext-kv-cache` for a byte-level baseline.

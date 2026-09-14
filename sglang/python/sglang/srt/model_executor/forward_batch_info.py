@@ -925,6 +925,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and getattr(ret.spec_info, "positions", None) is not None
         ):
             ret.positions = ret.spec_info.positions
+        elif batch.subcontext_positions is not None:
+            # Sub-context KV reuse (NOC): batch.extend_lens/extend_num_tokens
+            # were already shrunk to the surviving-token counts by
+            # prepare_for_extend, so the default compute_position() arange
+            # below would be correctly *sized* but wrong-valued (it assumes
+            # a contiguous [prefix_len, seq_len) run per request, not a
+            # gathered subset) -- use the true logical positions instead.
+            ret.positions = batch.subcontext_positions.to(device, non_blocking=True)
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():

@@ -121,9 +121,17 @@ from sglang.srt.mem_cache.subcontext.deviation_recompute import (
     plan_none,
     plan_prefix_fraction,
 )
+from sglang.srt.mem_cache.subcontext.extend_plan import (
+    RequestSubcontextPlan,
+    build_batch_subcontext_plan,
+    plan_request_extend,
+)
 from sglang.srt.mem_cache.subcontext.subcontext_index import SubContextIndex
 from sglang.srt.mem_cache.subcontext.subcontext_scanner import scan as subcontext_scan
-from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextTag
+from sglang.srt.mem_cache.subcontext.subcontext_types import (
+    SubcontextMaterializePlan,
+    SubContextTag,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -2394,6 +2402,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # DSV4NPUTokenToKVPoolAllocator (None elsewhere).
     out_cache_loc_dsv4: Optional[Any] = None
 
+    # Sub-context KV reuse (NOC): set by prepare_for_extend, None whenever no
+    # request in this batch has a resolved subcontext reuse plan (the default
+    # -- see prepare_for_extend for the eligibility gate). subcontext_positions
+    # overrides ForwardBatch.init_new's compute_position() result;
+    # subcontext_materialize_plan drives managers/tp_worker.py's
+    # materialize_reused_kv call ahead of the model forward.
+    subcontext_positions: Optional[torch.Tensor] = None
+    subcontext_materialize_plan: Optional[SubcontextMaterializePlan] = None
+
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     # Per-batch snapshot of the logical ping-pong positions selected for this
@@ -2689,6 +2706,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_range.length for r in reqs]
+
+        # Sub-context KV reuse (NOC): resolve, per request, which of its
+        # extend-range tokens can be materialized from a reused chunk
+        # instead of run through the model. Gated so tightly that this is
+        # dead code whenever the feature is off or no chunk actually
+        # recurred: req.subcontext_recompute_plans is only ever non-empty
+        # when a SubContextIndex was passed into init_next_round_input,
+        # which only happens with --enable-subcontext-kv-cache. Excluded
+        # here rather than left to fall out naturally: multimodal,
+        # positional-embed overrides, logprobs, DLLM, and the mamba extra
+        # buffer, none of which this bookkeeping accounts for.
+        subcontext_eligible_batch = (
+            not self.return_logprob
+            and not self.is_dllm()
+            and not get_exec().mamba.enable_mamba_extra_buffer
+        )
+        subcontext_request_plans: List[Optional[RequestSubcontextPlan]] = []
+        for i, r in enumerate(reqs):
+            if (
+                subcontext_eligible_batch
+                and r.subcontext_recompute_plans
+                and r.multimodal_inputs is None
+                and r.positional_embed_overrides is None
+            ):
+                subcontext_request_plans.append(
+                    plan_request_extend(
+                        r.subcontext_recompute_plans,
+                        prefix_len=prefix_lens[i],
+                        extend_len=extend_lens[i],
+                    )
+                )
+            else:
+                subcontext_request_plans.append(None)
+        subcontext_active = any(p is not None for p in subcontext_request_plans)
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
                 logprob_start_len=r.logprob_start_len,
@@ -2700,9 +2751,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        # Stay on pinned CPU; H2D is deferred to forward stream via
-        # resolve_forward_inputs.
-        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -2711,7 +2759,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
 
-        # Set batch fields needed by alloc_for_extend
+        # Set batch fields needed by alloc_for_extend. extend_lens/extend_num_tokens
+        # here must stay the *full* logical extend range -- allocation has to
+        # reserve a slot for every position a subcontext match will materialize
+        # into as well as every position the forward pass will write.
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.seq_lens = seq_lens_tensor
@@ -2722,6 +2773,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
+
+        self.subcontext_positions = None
+        self.subcontext_materialize_plan = None
+        if subcontext_active:
+            batch_plan = build_batch_subcontext_plan(
+                request_plans=subcontext_request_plans,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+                out_cache_loc=out_cache_loc,
+            )
+            out_cache_loc = batch_plan.out_cache_loc
+            self.extend_lens = batch_plan.extend_lens
+            self.extend_num_tokens = len(batch_plan.positions)
+            self.subcontext_positions = batch_plan.positions
+            if batch_plan.materialize_source_slots.numel() > 0:
+                self.subcontext_materialize_plan = SubcontextMaterializePlan(
+                    source_slots=batch_plan.materialize_source_slots,
+                    dest_slots=batch_plan.materialize_dest_slots,
+                    delta_positions=batch_plan.materialize_delta_positions,
+                )
+            input_ids = [
+                (
+                    array("q", (r.get_fill_ids()[p] for p in plan.surviving_absolute))
+                    if plan is not None
+                    else ids
+                )
+                for r, plan, ids in zip(reqs, subcontext_request_plans, input_ids)
+            ]
+
+        # Stay on pinned CPU; H2D is deferred to forward stream via
+        # resolve_forward_inputs.
+        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
 
         # Set fields
         input_embeds = []

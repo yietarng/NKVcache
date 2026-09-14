@@ -43,6 +43,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.subcontext.kv_materialize import (
+    materialize_reused_kv_for_batch,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -611,6 +614,15 @@ class TpModelWorker(BaseTpWorker):
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            # Sub-context KV reuse (NOC): fill in this batch's reused chunks'
+            # KV before the forward pass reads them -- pure data movement
+            # across all layers, so it must run here rather than inside
+            # ModelRunner.forward. See mem_cache/subcontext/kv_materialize.py.
+            if batch.subcontext_materialize_plan is not None:
+                materialize_reused_kv_for_batch(
+                    model_runner=self.model_runner,
+                    plan=batch.subcontext_materialize_plan,
+                )
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None

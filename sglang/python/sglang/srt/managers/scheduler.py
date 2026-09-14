@@ -284,6 +284,8 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.subcontext.kv_materialize import find_rotary_embedding
+from sglang.srt.mem_cache.subcontext.subcontext_index import SubContextIndex
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -680,6 +682,9 @@ class Scheduler(
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
+
+        # Init sub-context KV cache (NOC)
+        self.maybe_init_subcontext_index()
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
@@ -1681,6 +1686,23 @@ class Scheduler(
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
+
+    def maybe_init_subcontext_index(self) -> None:
+        """--enable-subcontext-kv-cache: a content-addressed index of
+        reusable sub-contexts (see mem_cache/subcontext/). MVP scope is
+        dense, standard-RoPE models only -- fail fast at startup rather
+        than silently no-op or corrupt output on an unsupported model."""
+        self.subcontext_index = None
+        if not get_memory().enable_subcontext_kv_cache:
+            return
+        if find_rotary_embedding(self.tp_worker.model_runner.model) is None:
+            raise ValueError(
+                "--enable-subcontext-kv-cache requires a model with exactly "
+                "one shared RotaryEmbedding module (dense, standard-RoPE "
+                "models only); this model doesn't have one. See "
+                "docs/docs/advanced_features/subcontext_kv_cache.mdx."
+            )
+        self.subcontext_index = SubContextIndex()
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -3872,7 +3894,11 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(
+                self.tree_cache,
+                subcontext_index=self.subcontext_index,
+                subcontext_recompute_ratio=get_memory().subcontext_recompute_ratio,
+            )
             if (
                 self.enable_hicache_storage
                 and get_memory().hicache_host_memory_mode == "buffer_only"
