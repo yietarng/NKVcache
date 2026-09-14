@@ -208,7 +208,15 @@ class TestMultiChunkStitching(unittest.TestCase):
     simultaneous chunks don't get cross-wired -- an indexing bug in
     build_batch_subcontext_plan's per-request loop (e.g. reusing the first
     match's source slots for the second) would silently corrupt attention
-    for the second chunk while every single-match test kept passing."""
+    for the second chunk while every single-match test kept passing.
+
+    Also pins down that position-independent coding (the RoPE delta
+    rotation) actually runs per chunk after stitching, rather than being
+    skipped or shared across chunks: verified against two independent
+    negative controls (repositioning turned into a no-op; one chunk's
+    delta silently swapped for the other's), both of which the assertions
+    here catch.
+    """
 
     def test_two_independent_chunks_stitch_without_cross_contamination(self):
         torch.manual_seed(0)
@@ -273,26 +281,41 @@ class TestMultiChunkStitching(unittest.TestCase):
         delta_a = float(match_a.delta_position)
         delta_b = float(match_b.delta_position)
 
-        for l in range(num_layers):
-            got_k_a = pool.get_key_buffer(l)[dest_a]
-            want_k_a = reposition_key(
-                expected_k_a[l],
-                delta_positions=torch.full((5,), delta_a),
+        def rotate(expected, delta, count):
+            return reposition_key(
+                expected,
+                delta_positions=torch.full((count,), delta),
                 inv_freq=inv_freq,
                 is_neox_style=True,
             )
+
+        for l in range(num_layers):
+            got_k_a = pool.get_key_buffer(l)[dest_a]
+            want_k_a = rotate(expected_k_a[l], delta_a, 5)
             torch.testing.assert_close(got_k_a, want_k_a, atol=1e-5, rtol=1e-5)
             torch.testing.assert_close(pool.get_value_buffer(l)[dest_a], expected_v_a[l])
 
             got_k_b = pool.get_key_buffer(l)[dest_b]
-            want_k_b = reposition_key(
-                expected_k_b[l],
-                delta_positions=torch.full((4,), delta_b),
-                inv_freq=inv_freq,
-                is_neox_style=True,
-            )
+            want_k_b = rotate(expected_k_b[l], delta_b, 4)
             torch.testing.assert_close(got_k_b, want_k_b, atol=1e-5, rtol=1e-5)
             torch.testing.assert_close(pool.get_value_buffer(l)[dest_b], expected_v_b[l])
+
+            # Position-independent coding must actually run per chunk, not
+            # get skipped or shared across chunks once multiple are stitched
+            # into one row: a chunk's stored K must differ from its raw
+            # un-rotated source (rotation had a real, non-trivial effect --
+            # delta_a/b are large enough that a no-op bug can't hide here),
+            # and must differ from what the *other* chunk's delta would have
+            # produced (rules out one chunk silently inheriting the other's
+            # position shift).
+            self.assertFalse(torch.allclose(got_k_a, expected_k_a[l], atol=1e-5))
+            self.assertFalse(
+                torch.allclose(got_k_a, rotate(expected_k_a[l], delta_b, 5), atol=1e-5)
+            )
+            self.assertFalse(torch.allclose(got_k_b, expected_k_b[l], atol=1e-5))
+            self.assertFalse(
+                torch.allclose(got_k_b, rotate(expected_k_b[l], delta_a, 4), atol=1e-5)
+            )
 
             # Surviving (glue) positions were never touched by materialization
             # -- the live forward still owns them.
