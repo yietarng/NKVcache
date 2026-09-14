@@ -1,0 +1,204 @@
+---
+title: "Sub-Context KV Cache (NOC)"
+metatags:
+    description: "Position-independent KV reuse for repeated sub-contexts in agentic workloads."
+---
+
+Agentic sessions resubmit large fractions of their context every turn (tool
+outputs, RAG fragments, system-prompt blocks) but RadixAttention's prefix
+match only discovers reuse when a span recurs at the *same* offset from
+position 0. This feature (internal name **NOC**) extends KV reuse to any
+recurring sub-context, independent of position, by keying a chunk's cached
+KV by content hash instead of tree path, and re-encoding it for its new
+position instead of recomputing it.
+
+## Status
+
+This document describes the full design. What's implemented and tested
+without a GPU, and what still needs GPU validation, is called out per
+section below -- see "Implementation status" at the end for the summary.
+
+## Algorithm
+
+1. **Scan (CPU).** After the ordinary prefix-radix match, scan the
+   unmatched suffix of the request's tokens against a content-addressed
+   index of previously-computed sub-contexts. Two sources: explicit tags
+   the caller attaches to the request (a tool-output span, a RAG fragment
+   id, ...), and automatic detection via rolling-hash probing.
+2. **Reposition.** A matched chunk's cached K was computed with RoPE baked
+   in at its original position. RoPE's rotation composes additively
+   (`Rot(p_new) = Rot(p_new - p_old) @ Rot(p_old)`), so the chunk's K is
+   moved to its new position by rotating it once more by the offset delta
+   -- no recomputation, no recovering the pre-rotation value. V carries no
+   positional encoding and is copied as-is.
+3. **Compute the rest from scratch.** Tokens not covered by any match
+   (the "glue" between sub-contexts) go through a normal forward pass, as
+   does a small selectively-recomputed subset of each match (see below).
+
+## Why reuse alone is an approximation
+
+Repositioning fixes a reused chunk's *position*, not its *content*: the
+chunk's K/V were computed while attending to whatever preceded it the
+first time it was seen, and now sit next to different neighbors. Following
+CacheBlend/EPIC (`https://github.com/DerekHJH/epic`), a configurable
+fraction of each chunk's tokens (`--subcontext-recompute-ratio`, default
+0.15; the chunk's leading tokens, prefix-fraction policy) is forced through
+a real forward pass instead of trusted as pure reuse, bounding the error.
+Setting the ratio to 0 recovers pure PromptCache-style reuse.
+
+## MVP scope
+
+Restricted to dense, standard-RoPE models (e.g. Llama-style) without MLA,
+mrope, SWA, Mamba, or the CUDA-graph fast path -- the surface where the
+delta-rotation trick and the "exclude reused tokens from the forward pass"
+batch construction are both straightforward. Wiring the remaining backends
+is follow-up work, not a design limitation of the approach itself.
+
+## Architecture
+
+### Content-addressed index (`mem_cache/subcontext/`)
+
+- `subcontext_types.py` -- `SubContextTag` (explicit boundary), `SubContextEntry`
+  (a registered chunk: content hash, token ids, original position, KV-pool
+  slot indices), `SubContextMatch` (one resolved hit in a new request),
+  `RecomputePlan` (which offsets of a match get force-recomputed).
+- `subcontext_index.py` -- `SubContextIndex`: sha256-content-hash keyed
+  store with LRU eviction and refcounting (`inc_ref`/`dec_ref`, mirroring
+  `RadixCache.inc_lock_ref`/`dec_lock_ref`) so a chunk locked by an
+  in-flight request is never evicted out from under it. A probe-hash
+  bucket (`PROBE_LEN`-token prefix hash) narrows scan candidates before a
+  full verify.
+- `subcontext_scanner.py` -- `scan(index, token_ids, explicit_tags, start)`:
+  greedy, longest-match-first scan restricted to `token_ids[start:]` (the
+  region *not* already covered by the ordinary prefix match, which is
+  strictly cheaper reuse and always wins where it applies).
+- `deviation_recompute.py` -- `plan_prefix_fraction` / `plan_none`: turns a
+  match into a `RecomputePlan`.
+
+**Tested**: `test/registered/unit/mem_cache/test_subcontext_cache.py` --
+10 cases covering the scanner's longest-match and explicit-tag-priority
+invariants, index refcount-blocks-eviction, and `RecomputePlan` boundary
+math. Pure CPU/tensor logic, runs on any runner.
+
+### RoPE delta-repositioning (`layers/rotary_embedding/reposition.py`)
+
+`reposition_key(cached_key, delta_positions, inv_freq, is_neox_style)`
+recomputes cos/sin directly from `delta_positions * inv_freq` (rather than
+indexing the model's position-capped cache, since a delta can be negative)
+and reapplies `apply_rotary_emb` on top of the already-rotated K. Callers
+pass only the rotary slice for partial-rotary models.
+
+**Tested**: rotation composition (`Rot(delta) @ Rot(p_old) == Rot(p_old +
+delta)`, both NeoX and GPT-J styles) verified numerically against the
+repo's real `apply_rotary_emb`, plus the zero-delta identity case.
+
+### Explicit tagging API
+
+`GenerateReqInput.subcontext_tags` (a list of `{"subcontext_id", "start",
+"end"}`, token offsets into the request's own tokens) flows through
+`TokenizedGenerateReqInput.subcontext_tags` (`managers/io_struct.py`,
+`managers/tokenizer_manager.py`) into `Req.subcontext_tags`
+(`managers/schedule_batch.py`). Ignored entirely unless
+`--enable-subcontext-kv-cache` is set.
+
+### CLI flags (`arg_groups/fields/memory.py`)
+
+- `--enable-subcontext-kv-cache` (default off)
+- `--subcontext-recompute-ratio` (default 0.15)
+
+Per the env-var-conventions skill, these are CLI flags (user-facing,
+expected to be documented and flipped per deployment), not env vars.
+Verified end-to-end: `ServerArgs.add_cli_args` / `from_cli_args` parse both
+flags and resolve them onto the flat `ServerArgs` object.
+
+### Scheduler-side matching (`managers/schedule_batch.py`)
+
+`Req.init_next_round_input` gained `subcontext_index` and
+`subcontext_recompute_ratio` parameters (both optional, default off, so
+every existing call site is unaffected). When a `SubContextIndex` is
+passed and the request has unmatched suffix tokens, it resolves
+`self.subcontext_tags` into `SubContextTag`s, scans the unmatched suffix,
+and stores the result on the request as `req.subcontext_matches` /
+`req.subcontext_recompute_plans`.
+
+**Verified**: `schedule_batch.py`, `scheduler.py`, `tokenizer_manager.py`,
+and `server_args.py` all import cleanly end-to-end with this change (full
+CPU dependency chain resolved and exercised in this repo's sandbox,
+without GPU/CUDA) -- the wiring is syntactically and structurally sound
+end to end from the HTTP request field down to the per-request match plan.
+
+## What's specified but not yet wired (needs GPU validation)
+
+Populating `req.subcontext_matches` does not yet change what gets fed to
+the model -- that's the part with no CPU-only way to validate against a
+real attention kernel, so it's left as a precise integration spec rather
+than an unverified patch to hot, frozen serving code
+(`model_executor/model_runner.py` is explicitly frozen;
+`managers/tp_worker.py` and the `ForwardBatch` construction path are
+extremely purity-constrained -- see `.claude/rules/`). Two things need to
+happen, in order, for a batch containing subcontext-matched requests:
+
+1. **Materialize reused KV before the model forward.** For each match's
+   *reused* ranges (`RecomputePlan.reused_ranges()` -- the match span minus
+   recomputed offsets), for every transformer layer: read the source
+   chunk's K/V from `MHATokenToKVPool.get_key_buffer(layer_id)` /
+   `get_value_buffer(layer_id)` at `entry.slots`, apply
+   `reposition_key(..., delta_positions=match.delta_position)` to K (V
+   unchanged), and write both into freshly allocated physical slots for
+   *this* request via `set_kv_buffer(layer, loc_info, cache_k, cache_v)`.
+   This is pure data movement across all layers at once -- no model
+   forward involved -- so it belongs in `TpModelWorker.forward_batch_generation`
+   (`managers/tp_worker.py`), right after `ForwardBatch.init_new(...)` and
+   before `self.model_runner.forward(...)`. `model_runner.py` itself does
+   not need to change.
+2. **Exclude pure-reuse tokens from the forward pass.** The materialized
+   tokens must not be re-run through the model (that's the entire point --
+   skipping the full per-layer forward, not just the attention math, is
+   what prefix caching already saves, and this generalizes it to
+   non-leading spans). Building `input_ids` / `positions` as a *gather*
+   over the surviving positions (glue tokens plus each match's
+   selectively-recomputed offsets) instead of the current contiguous
+   `arange(prefix_len, seq_len)` (`model_executor/forward_batch_info.py:
+   compute_position`) is the generalization prefix caching already makes
+   for one leading span; it needs to admit several interior spans.
+   `req_to_token_pool`'s row must place the materialized slots (step 1) at
+   their true logical offsets and the model-forward-written slots at
+   theirs, so existing attention backends need no change -- they already
+   attend over the full row up to `seq_len` regardless of which step wrote
+   which slot.
+
+This is a bigger, well-scoped follow-up (touches `ForwardBatch.init_new`'s
+purity contract and the extend-batch prep in `schedule_batch.py`) rather
+than a gap in the design: the mechanism above is exact given the
+MVP scope's constraints (standard RoPE, no partial forward paths from
+CUDA graphs to route around).
+
+## File list
+
+New:
+- `python/sglang/srt/mem_cache/subcontext/__init__.py`
+- `python/sglang/srt/mem_cache/subcontext/subcontext_types.py`
+- `python/sglang/srt/mem_cache/subcontext/subcontext_index.py`
+- `python/sglang/srt/mem_cache/subcontext/subcontext_scanner.py`
+- `python/sglang/srt/mem_cache/subcontext/deviation_recompute.py`
+- `python/sglang/srt/layers/rotary_embedding/reposition.py`
+- `test/registered/unit/mem_cache/test_subcontext_cache.py`
+
+Modified:
+- `python/sglang/srt/managers/schedule_batch.py` -- `Req.subcontext_tags` /
+  `subcontext_matches` / `subcontext_recompute_plans`;
+  `init_next_round_input` scan wiring.
+- `python/sglang/srt/managers/scheduler.py` -- pass `recv_req.subcontext_tags`
+  into `Req(...)`.
+- `python/sglang/srt/managers/io_struct.py` -- `GenerateReqInput.subcontext_tags`,
+  `TokenizedGenerateReqInput.subcontext_tags`.
+- `python/sglang/srt/managers/tokenizer_manager.py` -- propagate
+  `subcontext_tags` into `TokenizedGenerateReqInput`.
+- `python/sglang/srt/mem_cache/cache_init_params.py` --
+  `enable_subcontext_kv_cache`, `subcontext_recompute_ratio`.
+- `python/sglang/srt/arg_groups/fields/memory.py` -- the two CLI flags.
+
+Not yet touched (see "What's specified but not yet wired"):
+- `python/sglang/srt/managers/tp_worker.py` -- KV materialization call site.
+- `python/sglang/srt/model_executor/forward_batch_info.py` -- gathered
+  `input_ids`/`positions` construction for matched requests.
