@@ -129,6 +129,19 @@ class Memory(msgspec.Struct):
             ),
         ),
     ] = 0.15
+    subcontext_kv_cache_tokens: A[
+        int,
+        Arg(
+            help=(
+                "Number of token-slots permanently reserved from the KV pool "
+                "for registered sub-context chunks, on top of the ordinary "
+                "radix cache's allocation. Reserved once at startup via the "
+                "token allocator and never returned -- a fixed memory cost, "
+                "not a tunable-at-runtime budget. Only takes effect with "
+                "--enable-subcontext-kv-cache."
+            ),
+        ),
+    ] = 4096
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
     hicache_host_memory_mode: A[
         str,

@@ -1716,7 +1716,20 @@ class Scheduler(
                 f"to disable its ragged prefill fast path. See "
                 f"docs/docs/advanced_features/subcontext_kv_cache.mdx."
             )
-        self.subcontext_index = SubContextIndex()
+        num_slots = get_memory().subcontext_kv_cache_tokens
+        allocator = self.tp_worker.model_runner.token_to_kv_pool_allocator
+        slots = allocator.alloc(num_slots)
+        if slots is None:
+            raise ValueError(
+                f"--enable-subcontext-kv-cache could not reserve "
+                f"{num_slots} token-slots from the KV pool (not enough free "
+                f"capacity after the ordinary radix cache's allocation). "
+                f"Lower --subcontext-kv-cache-tokens or raise --mem-fraction-"
+                f"static."
+            )
+        index = SubContextIndex()
+        index.bind_slots(slots.tolist())
+        self.subcontext_index = index
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2537,6 +2550,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            subcontext_index=self.subcontext_index,
         )
 
     def init_req_max_new_tokens(self, req):

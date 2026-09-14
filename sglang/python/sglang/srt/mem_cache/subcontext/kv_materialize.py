@@ -100,6 +100,28 @@ def materialize_reused_kv(
         v_buffer.index_copy_(0, dest_slots, src_v)
 
 
+def copy_kv_to_new_slots(
+    *,
+    token_to_kv_pool: "KVCache",
+    layer_ids: Sequence[int],
+    source_slots: torch.Tensor,
+    dest_slots: torch.Tensor,
+) -> None:
+    """Straight per-layer K/V copy, no repositioning -- used to register a
+    finished request's span into the sub-context pool at its *original*
+    position. The stored K stays RoPE'd at that original absolute position;
+    ``reposition_key`` corrects it for wherever it's reused later
+    (``materialize_reused_kv``). Correct regardless of RoPE style since
+    nothing here depends on position."""
+    if source_slots.numel() == 0:
+        return
+    for layer_id in layer_ids:
+        k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+        v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+        k_buffer.index_copy_(0, dest_slots, k_buffer.index_select(0, source_slots))
+        v_buffer.index_copy_(0, dest_slots, v_buffer.index_select(0, source_slots))
+
+
 def attention_backend_supports_subcontext_reuse(backend_str: str) -> bool:
     """Whether ``backend_str`` reads the KV context for a query token from
     the full per-request page table (``req_to_token_pool``, sized off

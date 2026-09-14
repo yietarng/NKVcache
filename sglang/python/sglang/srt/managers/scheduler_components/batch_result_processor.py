@@ -29,8 +29,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
+    register_subcontext_entries,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.subcontext.subcontext_index import SubContextIndex
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
@@ -112,6 +114,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    subcontext_index: Optional[SubContextIndex] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -373,6 +376,18 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
+                        if (
+                            self.subcontext_index is not None
+                            and sampling_mask_finish_reason is None
+                        ):
+                            # Must run before release_kv_cache: that's what
+                            # frees or reassigns req.kv.req_pool_idx's row.
+                            register_subcontext_entries(
+                                req,
+                                self.subcontext_index,
+                                self.req_to_token_pool,
+                                self.model_worker.model_runner.token_to_kv_pool,
+                            )
                         release_kv_cache(
                             req,
                             self.tree_cache,

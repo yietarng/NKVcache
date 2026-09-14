@@ -15,11 +15,14 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.subcontext.kv_materialize import copy_kv_to_new_slots
+from sglang.srt.mem_cache.subcontext.subcontext_index import SubContextIndex
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -260,6 +263,50 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     unified_cache.retraction_discard(req.kv.retraction_backup)
     req.kv.retraction_backup = None
+
+
+def register_subcontext_entries(
+    req: Req,
+    subcontext_index: SubContextIndex,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool: "KVCache",
+) -> None:
+    """Copies req's explicitly-tagged sub-context spans into the
+    sub-context pool and registers them, so a *later* request's scan
+    (``Req.init_next_round_input``) can find and reuse them. Must run
+    while ``req.kv.req_pool_idx``'s row is still valid -- call this before
+    ``release_kv_cache``, which is what frees or reassigns it.
+
+    Bounded to ``req.effective_kv_committed_len()``, the same bound
+    ``release_kv_cache`` itself uses to decide what's safe to keep: a tag
+    reaching past it would read uncommitted, reclaimed, or never-written
+    slots.
+    """
+    if not req.subcontext_tags:
+        return
+    committed_len = req.effective_kv_committed_len()
+    row = req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+    layer_ids = range(token_to_kv_pool.start_layer, token_to_kv_pool.end_layer + 1)
+    for tag in req.subcontext_tags:
+        start, end = tag["start"], tag["end"]
+        if start < 0 or end > committed_len or start >= end:
+            continue
+        dest_slots = subcontext_index.register(
+            token_ids=req.full_untruncated_fill_ids[start:end],
+            orig_position=start,
+            subcontext_id=tag.get("subcontext_id"),
+        )
+        if dest_slots is None:
+            continue
+        source_slots = row[start:end].to(torch.int64)
+        copy_kv_to_new_slots(
+            token_to_kv_pool=token_to_kv_pool,
+            layer_ids=layer_ids,
+            source_slots=source_slots,
+            dest_slots=torch.tensor(
+                dest_slots, dtype=torch.int64, device=source_slots.device
+            ),
+        )
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):

@@ -14,11 +14,13 @@ position instead of recomputing it.
 
 ## Status
 
-The full mechanism described here is implemented, including the path that
-excludes reused tokens from the live forward pass (previously a spec-only
-section of this doc). What's verified without a GPU, and what still needs
-GPU validation before production use, is called out per section below --
-see "Implementation status" at the end for the summary.
+The full mechanism described here is implemented end to end: matching,
+reuse, and registration (the previous gap -- an index nothing ever
+populated -- is closed; see
+[Registration](#registration-populating-the-index)). What's verified
+without a GPU, and what still needs GPU validation before production use,
+is called out per section below -- see "What still needs GPU validation"
+at the end for the summary.
 
 ## Algorithm
 
@@ -65,22 +67,31 @@ is follow-up work, not a design limitation of the approach itself.
   slot indices), `SubContextMatch` (one resolved hit in a new request),
   `RecomputePlan` (which offsets of a match get force-recomputed).
 - `subcontext_index.py` -- `SubContextIndex`: sha256-content-hash keyed
-  store with LRU eviction and refcounting (`inc_ref`/`dec_ref`, mirroring
-  `RadixCache.inc_lock_ref`/`dec_lock_ref`) so a chunk locked by an
-  in-flight request is never evicted out from under it. A probe-hash
-  bucket (`PROBE_LEN`-token prefix hash) narrows scan candidates before a
-  full verify.
-- `subcontext_scanner.py` -- `scan(index, token_ids, explicit_tags, start)`:
-  greedy, longest-match-first scan restricted to `token_ids[start:]` (the
-  region *not* already covered by the ordinary prefix match, which is
-  strictly cheaper reuse and always wins where it applies).
+  store, backed by a fixed-size ring buffer of KV-pool slots reserved once
+  at startup (see [Registration](#registration-populating-the-index)
+  below). `register()` reserves ring space for a new entry, skipping past
+  any *referenced* (in-flight) occupant and evicting only unreferenced
+  ones in its way (`inc_ref`/`dec_ref` mirror
+  `RadixCache.inc_lock_ref`/`dec_lock_ref`) -- wraps to the start of the
+  buffer when the tail is too small, and gives up (returns `None`, no
+  side effects) if a full pass finds no room. A probe-hash bucket
+  (`PROBE_LEN`-token prefix hash) narrows scan candidates before a full
+  verify.
+- `subcontext_scanner.py` -- `scan(index, token_ids, explicit_tags, start, end)`:
+  greedy, longest-match-first scan restricted to `token_ids[start:end]`
+  (`start` excludes the region already covered by the ordinary prefix
+  match, which is strictly cheaper reuse and always wins where it
+  applies; `end` leaves at least the request's own last token
+  uncovered -- see the attention-backend section below).
 - `deviation_recompute.py` -- `plan_prefix_fraction` / `plan_none`: turns a
   match into a `RecomputePlan`.
 
 **Tested**: `test/registered/unit/mem_cache/test_subcontext_cache.py` --
-10 cases covering the scanner's longest-match and explicit-tag-priority
-invariants, index refcount-blocks-eviction, and `RecomputePlan` boundary
-math. Pure CPU/tensor logic, runs on any runner.
+27 cases covering the scanner's longest-match, explicit-tag-priority, and
+last-token-cap invariants; the index's ring-buffer reservation, wraparound,
+dedup, oversized-span rejection, and referenced-entry-survives-eviction
+invariants; and `RecomputePlan` boundary math. Pure CPU/tensor logic, runs
+on any runner.
 
 ### RoPE delta-repositioning (`layers/rotary_embedding/reposition.py`)
 
@@ -103,10 +114,70 @@ repo's real `apply_rotary_emb`, plus the zero-delta identity case.
 (`managers/schedule_batch.py`). Ignored entirely unless
 `--enable-subcontext-kv-cache` is set.
 
+### Registration: populating the index
+
+Everything above assumes the index already has content in it. Registration
+is what puts it there: it's the other half of the feature, hooked into the
+request-finished path rather than the request-scheduled path.
+
+**Storage.** Registered chunks live in a *dedicated* ring buffer of
+KV-pool slots (`--subcontext-kv-cache-tokens`, default 4096), reserved
+once at startup (`Scheduler.maybe_init_subcontext_index`, via
+`token_to_kv_pool_allocator.alloc(...)`) and never returned to the
+ordinary allocator. This is a deliberate choice over aliasing slots the
+radix-cache tree already owns: aliasing would need `SubContextIndex` to be
+notified whenever the tree's own eviction policy reclaims an overlapping
+node, and there's no such hook today. A dedicated pool sidesteps that
+coordination problem at the cost of a fixed, explicit memory reservation,
+and reuses the exact same `get_key_buffer`/`get_value_buffer`/
+`index_copy_` mechanism `materialize_reused_kv` already uses for
+consumption (`kv_materialize.copy_kv_to_new_slots` -- a plain copy, no
+repositioning, since the entry is stored at its *original* absolute
+position and `reposition_key` corrects it later, at consumption time, for
+wherever it's reused).
+
+**What gets registered.** Only explicitly-tagged spans
+(`req.subcontext_tags`), currently -- not automatic discovery of arbitrary
+recurring content. Automatic *detection* (finding a previously-registered
+span again, per the scan step above) doesn't imply automatic
+*registration*; deciding what to register without being told needs its
+own granularity/dedup/budget policy, which is future work, not something
+this pass silently assumes.
+
+**When.** `mem_cache/common.py: register_subcontext_entries(req,
+subcontext_index, req_to_token_pool, token_to_kv_pool)` runs from
+`managers/scheduler_components/batch_result_processor.py`, at the primary
+generation-finished site (`if req.finished(): ...`), *before*
+`release_kv_cache(...)` -- that's what frees or reassigns
+`req.kv.req_pool_idx`'s row, so registration has to read it first. Only
+requests that reach `finished()` (no further retraction possible) are
+registered; a still-running request's tagged span is not registered early
+and cannot be un-registered later, so registering before it's certain to
+survive would risk pointing the index at a span that gets evicted or
+retracted out from under it.
+
+**How.** For each tag with `end <= req.effective_kv_committed_len()` (the
+same bound `release_kv_cache` itself uses -- a tag reaching further would
+read uncommitted, reclaimed, or never-written slots): read the physical
+slots for `[start, end)` off `req_to_token_pool.req_to_token[req.kv.req_pool_idx]`,
+call `subcontext_index.register(token_ids=..., orig_position=start,
+subcontext_id=...)` to reserve ring-buffer space (`None` back means
+nothing to do -- already registered, too big for the pool, or no
+unreferenced room right now), then `copy_kv_to_new_slots` to actually move
+the K/V.
+
+**Tested**: the ring-buffer mechanics in isolation (see above). The
+`register_subcontext_entries` orchestration itself needs a real
+`req_to_token_pool` row and KV pool to exercise meaningfully, so it's
+verified by import/wiring checks here, not a unit test -- the same
+GPU-validation gap the rest of this doc already calls out.
+
 ### CLI flags (`arg_groups/fields/memory.py`)
 
 - `--enable-subcontext-kv-cache` (default off)
 - `--subcontext-recompute-ratio` (default 0.15)
+- `--subcontext-kv-cache-tokens` (default 4096) -- size of the dedicated
+  registration pool; startup fails if the allocator can't reserve it
 
 Per the env-var-conventions skill, these are CLI flags (user-facing,
 expected to be documented and flipped per deployment), not env vars.
@@ -260,22 +331,28 @@ New:
 - `python/sglang/srt/mem_cache/subcontext/extend_plan.py` -- per-request and
   per-batch plan builders consumed by `prepare_for_extend`.
 - `python/sglang/srt/mem_cache/subcontext/kv_materialize.py` -- the
-  materializer, `find_rotary_embedding`, and the `tp_worker.py` call-site
-  wrapper.
+  materializer, `copy_kv_to_new_slots` (registration's plain copy),
+  `find_rotary_embedding`, `attention_backend_supports_subcontext_reuse`,
+  and the `tp_worker.py` call-site wrapper.
 - `python/sglang/srt/layers/rotary_embedding/reposition.py`
 - `test/registered/unit/mem_cache/test_subcontext_cache.py`
 
 Modified:
 - `python/sglang/srt/managers/schedule_batch.py` -- `Req.subcontext_tags` /
   `subcontext_matches` / `subcontext_recompute_plans`;
-  `init_next_round_input` scan wiring; `ScheduleBatch.subcontext_positions` /
-  `subcontext_materialize_plan` fields; the eligibility gate, gathered
-  `input_ids`, and `out_cache_loc`/`extend_lens` rewrite in
-  `prepare_for_extend`.
+  `init_next_round_input` scan wiring (with the `end` cap); the eligibility
+  gate (incl. `input_embeds`), gathered `input_ids`, and
+  `out_cache_loc`/`extend_lens` rewrite in `prepare_for_extend`.
 - `python/sglang/srt/managers/scheduler.py` -- pass `recv_req.subcontext_tags`
-  into `Req(...)`; `Scheduler.maybe_init_subcontext_index` (constructs and
-  validates the index at startup); thread `self.subcontext_index` into the
-  main prefill admission's `init_next_round_input` call.
+  into `Req(...)`; `Scheduler.maybe_init_subcontext_index` (validates the
+  model and attention backend, reserves the registration pool, constructs
+  the index); thread `self.subcontext_index` into the main prefill
+  admission's `init_next_round_input` call and into
+  `SchedulerBatchResultProcessor`.
+- `python/sglang/srt/managers/scheduler_components/batch_result_processor.py`
+  -- `subcontext_index` field; calls `register_subcontext_entries` at the
+  primary generation-finished site, before `release_kv_cache`.
+- `python/sglang/srt/mem_cache/common.py` -- `register_subcontext_entries`.
 - `python/sglang/srt/managers/tp_worker.py` -- the
   `materialize_reused_kv_for_batch` call site in
   `forward_batch_generation`, right after `ForwardBatch.init_new`.
@@ -285,9 +362,7 @@ Modified:
   `TokenizedGenerateReqInput.subcontext_tags`.
 - `python/sglang/srt/managers/tokenizer_manager.py` -- propagate
   `subcontext_tags` into `TokenizedGenerateReqInput`.
-- `python/sglang/srt/mem_cache/cache_init_params.py` --
-  `enable_subcontext_kv_cache`, `subcontext_recompute_ratio`.
-- `python/sglang/srt/arg_groups/fields/memory.py` -- the two CLI flags.
+- `python/sglang/srt/arg_groups/fields/memory.py` -- the three CLI flags.
 
 ## What still needs GPU validation
 

@@ -4,6 +4,15 @@ Unlike ``RadixCache`` (keyed by root-to-node prefix path), this index is
 keyed purely by content hash: a sub-context can be looked up regardless of
 where it sits in a request's token sequence. See ``subcontext_scanner.py``
 for how a new request's tokens are matched against it.
+
+Physical storage is a fixed-size ring buffer of KV-pool slots, reserved
+once at startup (``Scheduler.maybe_init_subcontext_index``) and never
+returned to the main allocator -- registered chunks are *copies* living in
+their own space, not aliases into the ordinary radix-cache pool. Aliasing
+would need this index to be notified whenever the radix cache's own
+eviction policy reclaims an overlapping node, which it has no hook for
+today; a dedicated ring buffer sidesteps that coordination problem
+entirely at the cost of some fixed memory (``--subcontext-kv-cache-tokens``).
 """
 
 from __future__ import annotations
@@ -12,7 +21,7 @@ import hashlib
 import struct
 import threading
 from collections import OrderedDict
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextEntry
 
@@ -45,30 +54,83 @@ class SubContextIndex:
     request-scheduling path).
     """
 
-    def __init__(self, *, max_entries: int = 100_000):
-        self._max_entries = max_entries
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        # LRU by recency of *lookup*, so hot chunks survive eviction.
         self._entries: "OrderedDict[str, SubContextEntry]" = OrderedDict()
         self._by_probe: Dict[str, List[str]] = {}
         self._refcount: Dict[str, int] = {}
         self._hash_to_probe: Dict[str, str] = {}
 
+        self._slots: List[int] = []
+        self._cursor = 0
+        # content_hash occupying ring position i, or None if free.
+        self._ring_owner: List[Optional[str]] = []
+        # content_hash -> (ring_start, length), the range register() reserved.
+        self._ring_span: Dict[str, Tuple[int, int]] = {}
+
     def __len__(self) -> int:
         return len(self._entries)
 
-    def register(self, entry: SubContextEntry) -> None:
+    def bind_slots(self, slots: Sequence[int]) -> None:
+        """One-time setup: give the index the physical KV-pool slots it
+        owns (reserved once via the token allocator and never freed back).
+        Must be called before any ``register()``."""
         with self._lock:
-            if entry.content_hash in self._entries:
-                self._entries.move_to_end(entry.content_hash)
-                return
-            self._evict_locked_if_needed()
-            self._entries[entry.content_hash] = entry
-            self._refcount.setdefault(entry.content_hash, 0)
-            probe = probe_hash(entry.token_ids, 0)
+            assert not self._slots, "bind_slots must be called exactly once"
+            self._slots = list(slots)
+            self._ring_owner = [None] * len(self._slots)
+
+    @property
+    def capacity_tokens(self) -> int:
+        return len(self._slots)
+
+    def register(
+        self,
+        *,
+        token_ids: Sequence[int],
+        orig_position: int,
+        subcontext_id: Optional[str] = None,
+    ) -> Optional[List[int]]:
+        """Reserve ring-buffer slots for ``token_ids`` and insert its entry.
+
+        Returns the destination slot indices for the caller to copy K/V
+        into, or ``None`` when there is nothing to copy: the content is
+        already registered (a no-op touch), it's longer than the whole
+        pool, or no unreferenced room could be found (the pool is full of
+        in-flight entries -- registration is simply skipped, never forced
+        by evicting something a live request is still consuming).
+        """
+        token_ids = tuple(token_ids)
+        content_hash = hash_token_span(token_ids)
+        with self._lock:
+            if content_hash in self._entries:
+                self._entries.move_to_end(content_hash)
+                return None
+            length = len(token_ids)
+            if length == 0 or length > len(self._slots):
+                return None
+            ring_positions = self._reserve_ring_range_locked(length)
+            if ring_positions is None:
+                return None
+
+            dest_slots = [self._slots[p] for p in ring_positions]
+            entry = SubContextEntry(
+                content_hash=content_hash,
+                token_ids=token_ids,
+                orig_position=orig_position,
+                slots=tuple(dest_slots),
+                subcontext_id=subcontext_id,
+            )
+            self._entries[content_hash] = entry
+            self._refcount[content_hash] = 0
+            self._ring_span[content_hash] = (ring_positions[0], length)
+            for p in ring_positions:
+                self._ring_owner[p] = content_hash
+            probe = probe_hash(token_ids, 0)
             if probe is not None:
-                self._by_probe.setdefault(probe, []).append(entry.content_hash)
-                self._hash_to_probe[entry.content_hash] = probe
+                self._by_probe.setdefault(probe, []).append(content_hash)
+                self._hash_to_probe[content_hash] = probe
+            return dest_slots
 
     def lookup(self, content_hash: str) -> Optional[SubContextEntry]:
         with self._lock:
@@ -91,31 +153,45 @@ class SubContextIndex:
             if content_hash in self._refcount:
                 self._refcount[content_hash] = max(0, self._refcount[content_hash] - 1)
 
-    def _evict_locked_if_needed(self) -> None:
-        while len(self._entries) >= self._max_entries:
-            evicted = self._pop_lru_unreferenced_locked()
-            if evicted is None:
-                # Everything is referenced; refuse to grow further rather
-                # than evict something in-flight out from under a request.
-                return
-
-    def _pop_lru_unreferenced_locked(self) -> Optional[str]:
-        for content_hash in self._entries:
-            if self._refcount.get(content_hash, 0) == 0:
-                del self._entries[content_hash]
-                self._refcount.pop(content_hash, None)
-                probe = self._hash_to_probe.pop(content_hash, None)
-                if probe is not None and probe in self._by_probe:
-                    self._by_probe[probe].remove(content_hash)
-                    if not self._by_probe[probe]:
-                        del self._by_probe[probe]
-                return content_hash
+    def _reserve_ring_range_locked(self, length: int) -> Optional[List[int]]:
+        """First-fit search starting at the write cursor: find `length`
+        contiguous ring positions with no *referenced* (in-flight) occupant,
+        evicting whatever unreferenced entries are in the way, skip past a
+        referenced one and keep looking, wrap at the buffer end. Bounded to
+        one full pass over the ring so a pool saturated with in-flight
+        entries fails fast instead of spinning.
+        """
+        capacity = len(self._slots)
+        pos = self._cursor
+        probed = 0
+        while probed <= capacity:
+            if pos + length > capacity:
+                pos = 0
+            blocked_at = None
+            for p in range(pos, pos + length):
+                owner = self._ring_owner[p]
+                if owner is not None and self._refcount.get(owner, 0) > 0:
+                    blocked_at = p
+                    break
+            if blocked_at is None:
+                evicted = set()
+                for p in range(pos, pos + length):
+                    owner = self._ring_owner[p]
+                    if owner is not None and owner not in evicted:
+                        self._evict_entry_locked(owner)
+                        evicted.add(owner)
+                self._cursor = (pos + length) % capacity
+                return list(range(pos, pos + length))
+            probed += (blocked_at - pos) + 1
+            pos = blocked_at + 1
         return None
 
-    def evictable_entries(self) -> Iterable[SubContextEntry]:
-        with self._lock:
-            return [
-                e
-                for h, e in self._entries.items()
-                if self._refcount.get(h, 0) == 0
-            ]
+    def _evict_entry_locked(self, content_hash: str) -> None:
+        self._entries.pop(content_hash, None)
+        self._refcount.pop(content_hash, None)
+        self._ring_span.pop(content_hash, None)
+        probe = self._hash_to_probe.pop(content_hash, None)
+        if probe is not None and probe in self._by_probe:
+            self._by_probe[probe].remove(content_hash)
+            if not self._by_probe[probe]:
+                del self._by_probe[probe]

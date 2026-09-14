@@ -40,6 +40,9 @@ from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextEntry, Su
 
 
 def _make_entry(token_ids, orig_position=0, subcontext_id=None):
+    """Builds a standalone SubContextEntry for tests that consume one
+    directly (SubContextMatch/RecomputePlan), without going through a
+    SubContextIndex's ring-buffer slot reservation."""
     token_ids = tuple(token_ids)
     return SubContextEntry(
         content_hash=hash_token_span(token_ids),
@@ -48,6 +51,22 @@ def _make_entry(token_ids, orig_position=0, subcontext_id=None):
         slots=tuple(range(len(token_ids))),
         subcontext_id=subcontext_id,
     )
+
+
+def _new_index(capacity: int = 1000) -> SubContextIndex:
+    index = SubContextIndex()
+    index.bind_slots(range(capacity))
+    return index
+
+
+def _register(index, token_ids, orig_position=0, subcontext_id=None):
+    """Registers via the real SubContextIndex.register() API (ring-buffer
+    slot reservation + copy target) and returns the resulting entry."""
+    token_ids = tuple(token_ids)
+    index.register(
+        token_ids=token_ids, orig_position=orig_position, subcontext_id=subcontext_id
+    )
+    return index.lookup(hash_token_span(token_ids))
 
 
 class TestRepositionMath(unittest.TestCase):
@@ -340,20 +359,59 @@ class TestAttentionBackendSupportsSubcontextReuse(unittest.TestCase):
 class TestSubContextIndex(unittest.TestCase):
     def test_referenced_entry_survives_eviction_pressure(self):
         """A chunk locked by an in-flight request must not be evicted even
-        when the index is at capacity -- the same contract RadixCache's
-        inc_lock_ref/dec_lock_ref gives tree nodes."""
-        index = SubContextIndex(max_entries=2)
-        e1 = _make_entry(range(0, 8))
-        e2 = _make_entry(range(100, 108))
-        index.register(e1)
-        index.register(e2)
-        index.inc_ref(e1.content_hash)
+        under ring-buffer pressure -- the same contract RadixCache's
+        inc_lock_ref/dec_lock_ref gives tree nodes. A 16-slot pool holding
+        two 8-token entries is exactly full; registering a third must skip
+        past the referenced one and evict only the unreferenced one."""
+        index = SubContextIndex()
+        index.bind_slots(range(16))
+        e1_hash = hash_token_span(tuple(range(0, 8)))
+        e2_hash = hash_token_span(tuple(range(100, 108)))
+        e3_hash = hash_token_span(tuple(range(200, 208)))
 
-        e3 = _make_entry(range(200, 208))
-        index.register(e3)  # forces an eviction: e1 is locked, e2 is not
+        index.register(token_ids=range(0, 8), orig_position=0)
+        index.register(token_ids=range(100, 108), orig_position=100)
+        index.inc_ref(e1_hash)
 
-        self.assertIsNotNone(index.lookup(e1.content_hash))
-        self.assertIsNone(index.lookup(e2.content_hash))
+        index.register(token_ids=range(200, 208), orig_position=200)
+
+        self.assertIsNotNone(index.lookup(e1_hash))
+        self.assertIsNone(index.lookup(e2_hash))
+        self.assertIsNotNone(index.lookup(e3_hash))
+
+    def test_registering_a_span_longer_than_the_pool_is_a_no_op(self):
+        """A span that could never fit must be rejected cleanly (no
+        partial write, no crash), not treated as a 0-length reservation."""
+        index = SubContextIndex()
+        index.bind_slots(range(4))
+        dest = index.register(token_ids=range(0, 8), orig_position=0)
+        self.assertIsNone(dest)
+        self.assertEqual(len(index), 0)
+
+    def test_registration_wraps_to_the_start_when_the_tail_is_too_small(self):
+        """A 6-token entry can't fit in the last 4 slots of a 10-slot pool
+        (positions [6,10)); registration must wrap to the start rather
+        than silently under-allocate or write past the pool end -- the
+        prior occupant of [0,6) gets evicted to make room."""
+        index = SubContextIndex()
+        index.bind_slots(range(10))
+        first_hash = hash_token_span(tuple(range(0, 6)))
+        index.register(token_ids=range(0, 6), orig_position=0)  # -> ring[0:6]
+
+        dest = index.register(token_ids=range(100, 106), orig_position=100)
+        self.assertEqual(dest, list(range(0, 6)))  # wrapped, not [6, 12)
+        self.assertIsNone(index.lookup(first_hash))
+
+    def test_reregistering_the_same_content_is_a_no_op(self):
+        """Dedup: registering identical content twice must not consume a
+        second ring-buffer reservation (bookkeeping-only op)."""
+        index = SubContextIndex()
+        index.bind_slots(range(16))
+        first = index.register(token_ids=range(0, 8), orig_position=0)
+        second = index.register(token_ids=range(0, 8), orig_position=0)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(len(index), 1)
 
 
 class TestScanner(unittest.TestCase):
@@ -361,11 +419,9 @@ class TestScanner(unittest.TestCase):
         """Two registered chunks share a common prefix; scanning must pick
         the longer one so a short chunk never shadows a bigger reuse
         opportunity it happens to start with."""
-        index = SubContextIndex()
-        short = _make_entry(range(0, 8))
-        long = _make_entry(list(range(0, 8)) + list(range(50, 58)))
-        index.register(short)
-        index.register(long)
+        index = _new_index()
+        short = _register(index, range(0, 8))
+        long = _register(index, list(range(0, 8)) + list(range(50, 58)))
 
         query = list(range(0, 8)) + list(range(50, 58)) + [999]
         matches = scan(index, query)
@@ -378,9 +434,8 @@ class TestScanner(unittest.TestCase):
         """An explicit tag's span must not also be claimed by the
         automatic scanner (double-covering would double-count reuse and
         corrupt the recompute plan built on top of it)."""
-        index = SubContextIndex()
-        entry = _make_entry(range(0, 8), subcontext_id="sys-prompt")
-        index.register(entry)
+        index = _new_index()
+        _register(index, range(0, 8), subcontext_id="sys-prompt")
 
         query = list(range(0, 8)) + [999]
         tags = [SubContextTag(subcontext_id="sys-prompt", start=0, end=8)]
@@ -395,9 +450,8 @@ class TestScanner(unittest.TestCase):
         not be re-reported here -- prefix reuse is strictly cheaper (no
         rotation, zero-copy) and double-claiming it would corrupt the
         reused-token accounting downstream."""
-        index = SubContextIndex()
-        entry = _make_entry(range(0, 8))
-        index.register(entry)
+        index = _new_index()
+        _register(index, range(0, 8))
 
         query = list(range(0, 8)) + [1, 2, 3] + list(range(0, 8))
         matches = scan(index, query, start=8)
@@ -412,9 +466,8 @@ class TestScanner(unittest.TestCase):
         _compute_max_prefix_len caps the ordinary prefix match at
         input_len - 1 for exactly this reason; scan's `end` must give the
         same guarantee for subcontext matches."""
-        index = SubContextIndex()
-        entry = _make_entry(range(0, 9))
-        index.register(entry)
+        index = _new_index()
+        _register(index, range(0, 9))
 
         query = list(range(0, 9))  # a 9-token match would exactly cover this whole query
         matches = scan(index, query, end=len(query) - 1)
@@ -427,9 +480,8 @@ class TestScanner(unittest.TestCase):
     def test_no_false_match_on_probe_collision_without_full_verify(self):
         """A candidate sharing only the probe-hash prefix but diverging
         later must be rejected -- the probe is a filter, not proof."""
-        index = SubContextIndex()
-        entry = _make_entry(list(range(0, 8)) + [12345])
-        index.register(entry)
+        index = _new_index()
+        _register(index, list(range(0, 8)) + [12345])
 
         query = list(range(0, 8)) + [99999]  # same first 8 tokens, then diverges
         matches = scan(index, query)
@@ -441,7 +493,6 @@ class TestRecomputePlan(unittest.TestCase):
         """Boundary math: reused_ranges() must be exactly the match span
         minus the recomputed offsets, as disjoint contiguous pieces --
         get this wrong and reused KV silently overlaps recomputed KV."""
-        index = SubContextIndex()
         entry = _make_entry(range(0, 10), orig_position=0)
         from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
 
@@ -452,7 +503,6 @@ class TestRecomputePlan(unittest.TestCase):
         self.assertEqual(plan.reused_ranges(), ((23, 30),))
 
     def test_zero_ratio_reuses_the_whole_match(self):
-        index = SubContextIndex()
         entry = _make_entry(range(0, 5), orig_position=0)
         from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
 
