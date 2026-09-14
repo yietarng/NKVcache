@@ -197,6 +197,111 @@ class TestMaterializeReusedKv(unittest.TestCase):
         torch.testing.assert_close(got_pass_through, expected_pass_through)
 
 
+class TestMultiChunkStitching(unittest.TestCase):
+    """End-to-end (minus the real model): one request whose extend range
+    reuses KV from *two independently registered* sub-context chunks
+    (different original positions, different physical source slots --
+    "different radix trees" of KV, in the sense that each was computed by
+    a different earlier request), stitched together with the tokens that
+    still need a real forward pass. Every earlier test in this file
+    exercises one match at a time; this is the only one that proves two
+    simultaneous chunks don't get cross-wired -- an indexing bug in
+    build_batch_subcontext_plan's per-request loop (e.g. reusing the first
+    match's source slots for the second) would silently corrupt attention
+    for the second chunk while every single-match test kept passing."""
+
+    def test_two_independent_chunks_stitch_without_cross_contamination(self):
+        torch.manual_seed(0)
+        num_layers, pool_size, num_heads, head_dim = 2, 2048, 2, 16
+        pool = _FakePool(num_layers, pool_size, num_heads, head_dim)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+
+        # Request layout: prefix_len=5 (radix-matched, out of scope here),
+        # extend range covers absolute positions [5, 25). Two entries with
+        # disjoint, identifiable source slots -- "different radix trees" of
+        # KV, each computed by a different earlier request.
+        from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
+
+        prefix_len, extend_len = 5, 20
+        entry_a = SubContextEntry(
+            content_hash="a", token_ids=tuple(range(0, 5)), orig_position=50,
+            slots=(10, 11, 12, 13, 14),
+        )
+        entry_b = SubContextEntry(
+            content_hash="b", token_ids=tuple(range(0, 4)), orig_position=200,
+            slots=(90, 91, 92, 93),
+        )
+        match_a = SubContextMatch(entry=entry_a, query_start=7, query_end=12, source="scanned")
+        match_b = SubContextMatch(entry=entry_b, query_start=16, query_end=20, source="scanned")
+
+        plan = plan_request_extend(
+            [plan_none(match_a), plan_none(match_b)],
+            prefix_len=prefix_len,
+            extend_len=extend_len,
+        )
+        # out_cache_loc as alloc_for_extend would hand back: one physical
+        # slot per logical position in the extend range, contiguous.
+        out_cache_loc = torch.arange(2000, 2000 + extend_len)
+        batch_plan = build_batch_subcontext_plan(
+            request_plans=[plan],
+            prefix_lens=[prefix_len],
+            extend_lens=[extend_len],
+            out_cache_loc=out_cache_loc,
+        )
+
+        expected_k_a = [pool.get_key_buffer(l)[list(entry_a.slots)].clone() for l in range(num_layers)]
+        expected_k_b = [pool.get_key_buffer(l)[list(entry_b.slots)].clone() for l in range(num_layers)]
+        expected_v_a = [pool.get_value_buffer(l)[list(entry_a.slots)].clone() for l in range(num_layers)]
+        expected_v_b = [pool.get_value_buffer(l)[list(entry_b.slots)].clone() for l in range(num_layers)]
+        untouched_before = [pool.get_key_buffer(l).clone() for l in range(num_layers)]
+
+        materialize_reused_kv(
+            token_to_kv_pool=pool,
+            layer_ids=range(num_layers),
+            source_slots=batch_plan.materialize_source_slots,
+            dest_slots=batch_plan.materialize_dest_slots,
+            delta_positions=batch_plan.materialize_delta_positions,
+            inv_freq=inv_freq,
+            is_neox_style=True,
+            rotary_dim=head_dim,
+        )
+
+        # dest slots = out_cache_loc at match_a/b's local offsets within
+        # the extend range: match_a -> [2,7), match_b -> [11,15).
+        dest_a = out_cache_loc[2:7]
+        dest_b = out_cache_loc[11:15]
+        delta_a = float(match_a.delta_position)
+        delta_b = float(match_b.delta_position)
+
+        for l in range(num_layers):
+            got_k_a = pool.get_key_buffer(l)[dest_a]
+            want_k_a = reposition_key(
+                expected_k_a[l],
+                delta_positions=torch.full((5,), delta_a),
+                inv_freq=inv_freq,
+                is_neox_style=True,
+            )
+            torch.testing.assert_close(got_k_a, want_k_a, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(pool.get_value_buffer(l)[dest_a], expected_v_a[l])
+
+            got_k_b = pool.get_key_buffer(l)[dest_b]
+            want_k_b = reposition_key(
+                expected_k_b[l],
+                delta_positions=torch.full((4,), delta_b),
+                inv_freq=inv_freq,
+                is_neox_style=True,
+            )
+            torch.testing.assert_close(got_k_b, want_k_b, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(pool.get_value_buffer(l)[dest_b], expected_v_b[l])
+
+            # Surviving (glue) positions were never touched by materialization
+            # -- the live forward still owns them.
+            survive_slots = out_cache_loc[list(plan.surviving_local)]
+            torch.testing.assert_close(
+                pool.get_key_buffer(l)[survive_slots], untouched_before[l][survive_slots]
+            )
+
+
 class TestExtendPlan(unittest.TestCase):
     def _match(self, start, end, orig_position=0):
         from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
