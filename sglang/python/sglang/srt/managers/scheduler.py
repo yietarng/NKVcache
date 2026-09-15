@@ -284,6 +284,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.subcontext.deviation_recompute import VALID_BRZ_WINDOWS
 from sglang.srt.mem_cache.subcontext.kv_materialize import (
     attention_backend_supports_subcontext_reuse,
     find_rotary_embedding,
@@ -1700,6 +1701,11 @@ class Scheduler(
         self.subcontext_index = None
         if not get_memory().enable_subcontext_kv_cache:
             return
+        if get_memory().subcontext_brz_window not in VALID_BRZ_WINDOWS:
+            raise ValueError(
+                f"--subcontext-brz-window must be one of {VALID_BRZ_WINDOWS}, "
+                f"got {get_memory().subcontext_brz_window}."
+            )
         if find_rotary_embedding(self.tp_worker.model_runner.model) is None:
             raise ValueError(
                 "--enable-subcontext-kv-cache requires a model with exactly "
@@ -3925,7 +3931,7 @@ class Scheduler(
             req.init_next_round_input(
                 self.tree_cache,
                 subcontext_index=self.subcontext_index,
-                subcontext_recompute_ratio=get_memory().subcontext_recompute_ratio,
+                subcontext_brz_window=get_memory().subcontext_brz_window,
             )
             if (
                 self.enable_hicache_storage

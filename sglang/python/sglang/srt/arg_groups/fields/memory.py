@@ -116,19 +116,27 @@ class Memory(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
-    subcontext_recompute_ratio: A[
-        float,
+    subcontext_brz_window: A[
+        int,
         Arg(
             help=(
-                "Fraction of each reused sub-context's tokens to selectively "
-                "recompute (CacheBlend/EPIC-style) rather than trust as pure "
-                "reuse, correcting for the chunk's KV having originally "
-                "attended to different neighboring content. 0.0 disables the "
-                "correction (pure reposition-and-reuse). Only takes effect "
-                "with --enable-subcontext-kv-cache."
+                "Boundary Recompute Zone window k, in tokens: at every "
+                "stitched boundary between adjacent segments A and B, "
+                "recompute Last_k(A) union First_k(B) (CacheBlend/EPIC-style) "
+                "instead of trusting pure KV reuse there, correcting for each "
+                "segment's KV having originally attended to different "
+                "neighboring content. A reused chunk's own leading k tokens "
+                "are always recomputed (whatever precedes it is essentially "
+                "never what preceded it originally); its trailing k tokens "
+                "are additionally recomputed only when another reused chunk "
+                "is stitched immediately after it with no fresh glue between "
+                "them. Must be one of 0 (disables the correction -- pure "
+                "reposition-and-reuse), 16, 32, or 64. Only takes effect with "
+                "--enable-subcontext-kv-cache."
             ),
+            choices=[0, 16, 32, 64],
         ),
-    ] = 0.15
+    ] = 32
     subcontext_kv_cache_tokens: A[
         int,
         Arg(

@@ -118,8 +118,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.subcontext.deviation_recompute import (
-    plan_none,
-    plan_prefix_fraction,
+    plan_boundary_recompute_zones,
 )
 from sglang.srt.mem_cache.subcontext.extend_plan import (
     RequestSubcontextPlan,
@@ -1528,7 +1527,7 @@ class Req(ReqDllmMixin):
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
         subcontext_index: Optional[SubContextIndex] = None,
-        subcontext_recompute_ratio: float = 0.0,
+        subcontext_brz_window: int = 0,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1660,16 +1659,9 @@ class Req(ReqDllmMixin):
                     end=input_len - 1,
                 )
                 self.subcontext_matches = matches
-                self.subcontext_recompute_plans = [
-                    (
-                        plan_prefix_fraction(
-                            match, recompute_ratio=subcontext_recompute_ratio
-                        )
-                        if subcontext_recompute_ratio > 0.0
-                        else plan_none(match)
-                    )
-                    for match in matches
-                ]
+                self.subcontext_recompute_plans = plan_boundary_recompute_zones(
+                    matches, k=subcontext_brz_window
+                )
 
         if (
             self.is_retracted

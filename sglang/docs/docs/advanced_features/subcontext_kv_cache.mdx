@@ -44,11 +44,20 @@ at the end for the summary.
 Repositioning fixes a reused chunk's *position*, not its *content*: the
 chunk's K/V were computed while attending to whatever preceded it the
 first time it was seen, and now sit next to different neighbors. Following
-CacheBlend/EPIC (`https://github.com/DerekHJH/epic`), a configurable
-fraction of each chunk's tokens (`--subcontext-recompute-ratio`, default
-0.15; the chunk's leading tokens, prefix-fraction policy) is forced through
-a real forward pass instead of trusted as pure reuse, bounding the error.
-Setting the ratio to 0 recovers pure PromptCache-style reuse.
+CacheBlend/EPIC (`https://github.com/DerekHJH/epic`), a **Boundary
+Recompute Zone (BRZ)** around each stitched boundary is forced through a
+real forward pass instead of trusted as pure reuse, bounding the error:
+for adjacent segments A and B, `BRZ(A, B) = Last_k(A) union First_k(B)`,
+with the window `k` (`--subcontext-brz-window`, default 32, one of `{0,
+16, 32, 64}`) fixed in tokens rather than scaled to chunk length. A
+reused chunk's own leading `k` tokens are always recomputed -- whatever
+precedes it in the new sequence is essentially never what preceded it
+originally. Its trailing `k` tokens are *additionally* recomputed only
+when another reused chunk is stitched immediately after it with no fresh
+glue in between (a genuine A/B stitch); a chunk followed by freshly
+computed glue needs no trailing repair, since glue is already computed
+against this chunk's true tail. Setting `k` to 0 recovers pure
+PromptCache-style reuse.
 
 ## MVP scope
 
@@ -83,8 +92,10 @@ is follow-up work, not a design limitation of the approach itself.
   match, which is strictly cheaper reuse and always wins where it
   applies; `end` leaves at least the request's own last token
   uncovered -- see the attention-backend section below).
-- `deviation_recompute.py` -- `plan_prefix_fraction` / `plan_none`: turns a
-  match into a `RecomputePlan`.
+- `deviation_recompute.py` -- `plan_boundary_recompute_zones`: applies BRZ
+  across every match in a request at once (needs the full, query-ordered
+  match list to detect which pairs are actually stitched together), turning
+  each into a `RecomputePlan`.
 
 **Tested**: `test/registered/unit/mem_cache/test_subcontext_cache.py` --
 27 cases covering the scanner's longest-match, explicit-tag-priority, and
@@ -175,19 +186,20 @@ GPU-validation gap the rest of this doc already calls out.
 ### CLI flags (`arg_groups/fields/memory.py`)
 
 - `--enable-subcontext-kv-cache` (default off)
-- `--subcontext-recompute-ratio` (default 0.15)
+- `--subcontext-brz-window` (default 32, one of `{0, 16, 32, 64}`) -- the
+  BRZ window `k`; startup fails if it's any other value
 - `--subcontext-kv-cache-tokens` (default 4096) -- size of the dedicated
   registration pool; startup fails if the allocator can't reserve it
 
 Per the env-var-conventions skill, these are CLI flags (user-facing,
 expected to be documented and flipped per deployment), not env vars.
-Verified end-to-end: `ServerArgs.add_cli_args` / `from_cli_args` parse both
-flags and resolve them onto the flat `ServerArgs` object.
+Verified end-to-end: `ServerArgs.add_cli_args` / `from_cli_args` parse all
+three flags and resolve them onto the flat `ServerArgs` object.
 
 ### Scheduler-side matching (`managers/schedule_batch.py`)
 
 `Req.init_next_round_input` gained `subcontext_index` and
-`subcontext_recompute_ratio` parameters (both optional, default off, so
+`subcontext_brz_window` parameters (both optional, default off, so
 every existing call site is unaffected). When a `SubContextIndex` is
 passed and the request has unmatched suffix tokens, it resolves
 `self.subcontext_tags` into `SubContextTag`s, scans the unmatched suffix,
@@ -378,6 +390,6 @@ backend's `cu_seqlens_q`/context-length split behaves as analyzed under
 codebase produces that inequality for a plain (non-chunked, non-retracted)
 extend batch. Recommended smoke test before any real traffic: a small
 Llama-style model, a handful of requests that share an explicitly-tagged
-sub-context at different offsets, `--subcontext-recompute-ratio 0` (pure
+sub-context at different offsets, `--subcontext-brz-window 0` (pure
 reuse, easiest to reason about), comparing output logits against the same
 prompts run without `--enable-subcontext-kv-cache` for a byte-level baseline.

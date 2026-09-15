@@ -113,7 +113,7 @@ treating this as production-ready.
 
 ### 2. Matching, once per scheduling round
 
-`Req.init_next_round_input(tree_cache, subcontext_index=self.subcontext_index, subcontext_recompute_ratio=...)`
+`Req.init_next_round_input(tree_cache, subcontext_index=self.subcontext_index, subcontext_brz_window=...)`
 — `managers/schedule_batch.py`, called from `managers/scheduler.py`'s main
 prefill admission loop.
 
@@ -129,10 +129,14 @@ prefill admission loop.
    a cheap candidate filter (`mem_cache/subcontext/subcontext_index.py`).
    `end=input_len-1` guarantees at least one token is always left over to
    compute a logit and sample from.
-3. Each match becomes a `RecomputePlan` — `plan_prefix_fraction` (recompute
-   the first `subcontext_recompute_ratio` fraction of the match, CacheBlend/
-   EPIC-style correction) or `plan_none` (pure reuse, ratio = 0)
-   (`mem_cache/subcontext/deviation_recompute.py`).
+3. The full, query-ordered match list becomes a list of `RecomputePlan`s via
+   `plan_boundary_recompute_zones(matches, k=subcontext_brz_window)`
+   (`mem_cache/subcontext/deviation_recompute.py`): every match's own
+   leading `k` tokens are recomputed (CacheBlend/EPIC-style correction,
+   `First_k(B)`); a match's trailing `k` tokens are *additionally*
+   recomputed when the next match starts exactly where it ends -- a
+   genuine stitched boundary, no glue between them (`Last_k(A)`). `k=0`
+   is pure reuse, no correction.
 4. Result: `req.subcontext_matches` and `req.subcontext_recompute_plans`.
 
 ### 3. Batch construction
@@ -248,7 +252,7 @@ the vendored tree) for the full writeup.
 | `subcontext_types.py` | `SubContextTag`, `SubContextEntry`, `SubContextMatch`, `RecomputePlan`, `SubcontextMaterializePlan` |
 | `subcontext_index.py` | `SubContextIndex` — content-hash lookup + ring-buffer physical slot reservation/eviction |
 | `subcontext_scanner.py` | `scan()` — explicit-tag + automatic longest-match detection over the unmatched suffix, capped short of the request's last token |
-| `deviation_recompute.py` | `plan_prefix_fraction` / `plan_none` — selective-recompute policy |
+| `deviation_recompute.py` | `plan_boundary_recompute_zones` — Boundary Recompute Zone policy |
 | `extend_plan.py` | `plan_request_extend`, `build_batch_subcontext_plan` — per-request and per-batch split of the extend range |
 | `kv_materialize.py` | `materialize_reused_kv`, `materialize_reused_kv_for_batch`, `copy_kv_to_new_slots`, `find_rotary_embedding`, `attention_backend_supports_subcontext_reuse` |
 
@@ -272,7 +276,7 @@ the vendored tree) for the full writeup.
 | `model_executor/forward_batch_info.py` | `ForwardBatch.init_new`'s `positions` override branch |
 | `managers/io_struct.py` | `GenerateReqInput.subcontext_tags`, `TokenizedGenerateReqInput.subcontext_tags` |
 | `managers/tokenizer_manager.py` | Propagates `subcontext_tags` into `TokenizedGenerateReqInput` |
-| `arg_groups/fields/memory.py` | `--enable-subcontext-kv-cache`, `--subcontext-recompute-ratio`, `--subcontext-kv-cache-tokens` CLI flags |
+| `arg_groups/fields/memory.py` | `--enable-subcontext-kv-cache`, `--subcontext-brz-window`, `--subcontext-kv-cache-tokens` CLI flags |
 
 All paths above are relative to `sglang/python/sglang/srt/` (or `sglang/test/`,
 `sglang/docs/`) inside this repo, on branch
@@ -297,6 +301,6 @@ has run against a real GPU, model, or attention kernel. In particular:
 Recommended smoke test before any real traffic: a small Llama-style model,
 `--attention-backend fa3 --enable-subcontext-kv-cache`, a first request
 tagging a span (`subcontext_tags`), a second request whose prompt repeats
-that exact span at a different offset, `--subcontext-recompute-ratio 0`
+that exact span at a different offset, `--subcontext-brz-window 0`
 (pure reuse, easiest to reason about) — confirm the second request's
 output matches a baseline run with the feature off.

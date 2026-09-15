@@ -20,8 +20,7 @@ import torch
 from sglang.srt.layers.rotary_embedding.reposition import reposition_key
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.mem_cache.subcontext.deviation_recompute import (
-    plan_none,
-    plan_prefix_fraction,
+    plan_boundary_recompute_zones,
 )
 from sglang.srt.mem_cache.subcontext.extend_plan import (
     build_batch_subcontext_plan,
@@ -67,6 +66,15 @@ def _register(index, token_ids, orig_position=0, subcontext_id=None):
         token_ids=token_ids, orig_position=orig_position, subcontext_id=subcontext_id
     )
     return index.lookup(hash_token_span(token_ids))
+
+
+def _no_recompute(match):
+    """Fixture helper for tests that need *some* RecomputePlan but aren't
+    testing the BRZ policy itself (extend-plan/stitching mechanics). Routes
+    through the real plan_boundary_recompute_zones with k=0 rather than
+    reinventing "empty recompute_offsets" locally, so it can't drift from
+    what k=0 actually produces."""
+    return plan_boundary_recompute_zones([match], k=0)[0]
 
 
 class TestRepositionMath(unittest.TestCase):
@@ -243,7 +251,7 @@ class TestMultiChunkStitching(unittest.TestCase):
         match_b = SubContextMatch(entry=entry_b, query_start=16, query_end=20, source="scanned")
 
         plan = plan_request_extend(
-            [plan_none(match_a), plan_none(match_b)],
+            [_no_recompute(match_a), _no_recompute(match_b)],
             prefix_len=prefix_len,
             extend_len=extend_len,
         )
@@ -337,12 +345,12 @@ class TestExtendPlan(unittest.TestCase):
         fully dropped (computed normally), not partially materialized --
         chunked prefill would otherwise reuse KV for tokens this chunk
         never actually allocated slots for."""
-        plan = plan_none(self._match(10, 30))  # extends past extend_end=20
+        plan = _no_recompute(self._match(10, 30))  # extends past extend_end=20
         ranges = reused_ranges_within([plan], extend_start=0, extend_end=20)
         self.assertEqual(ranges, [])
 
     def test_fully_covered_match_is_kept(self):
-        plan = plan_none(self._match(10, 20))
+        plan = _no_recompute(self._match(10, 20))
         ranges = reused_ranges_within([plan], extend_start=0, extend_end=20)
         self.assertEqual(len(ranges), 1)
         self.assertEqual(ranges[0][:2], (10, 20))
@@ -381,7 +389,7 @@ class TestExtendPlan(unittest.TestCase):
 
         match = SubContextMatch(entry=entry, query_start=105, query_end=112, source="scanned")
         plan = plan_request_extend(
-            [plan_none(match)], prefix_len=prefix_len, extend_len=extend_len
+            [_no_recompute(match)], prefix_len=prefix_len, extend_len=extend_len
         )
 
         self.assertEqual(plan.reused_local, tuple(range(5, 12)))
@@ -616,27 +624,105 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(matches, [])
 
 
-class TestRecomputePlan(unittest.TestCase):
-    def test_reused_ranges_excludes_recomputed_offsets(self):
-        """Boundary math: reused_ranges() must be exactly the match span
-        minus the recomputed offsets, as disjoint contiguous pieces --
-        get this wrong and reused KV silently overlaps recomputed KV."""
-        entry = _make_entry(range(0, 10), orig_position=0)
+class TestBoundaryRecomputeZone(unittest.TestCase):
+    """BRZ(A, B) = Last_k(A) union First_k(B) for adjacent segments A, B.
+    plan_boundary_recompute_zones takes the full, query-ordered match list
+    so it can tell "adjacent" (no glue between two matches) from "isolated"
+    (glue, prefix, or nothing on one side) -- these tests pin down that
+    distinction, since getting it wrong either recomputes tokens no
+    boundary needs (wasted compute) or silently skips a real stitch."""
+
+    def _match(self, entry, start, end):
         from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
 
-        match = SubContextMatch(entry=entry, query_start=20, query_end=30, source="scanned")
-        plan = plan_prefix_fraction(match, recompute_ratio=0.3)  # ceil(10*0.3)=3
+        return SubContextMatch(entry=entry, query_start=start, query_end=end, source="scanned")
+
+    def test_isolated_match_gets_only_leading_first_k(self):
+        """A match with nothing stitched after it (end of range, or glue
+        follows) must recompute only its own leading k tokens -- First_k(B)
+        -- never its trailing edge, since nothing-empty-handed to repair."""
+        entry = _make_entry(range(0, 10), orig_position=0)
+        match = self._match(entry, 20, 30)
+        (plan,) = plan_boundary_recompute_zones([match], k=3)
 
         self.assertEqual(plan.recompute_offsets, (0, 1, 2))
         self.assertEqual(plan.reused_ranges(), ((23, 30),))
 
-    def test_zero_ratio_reuses_the_whole_match(self):
-        entry = _make_entry(range(0, 5), orig_position=0)
-        from sglang.srt.mem_cache.subcontext.subcontext_types import SubContextMatch
+    def test_stitched_pair_gets_last_k_and_first_k_on_each_side(self):
+        """Two matches with zero gap between them (match_a.query_end ==
+        match_b.query_start) is exactly BRZ's "adjacent segments" case:
+        match_a's trailing k tokens (Last_k(A)) and match_b's leading k
+        tokens (First_k(B)) both get recomputed."""
+        entry_a = _make_entry(range(0, 10), orig_position=0)
+        entry_b = _make_entry(range(0, 10), orig_position=100)
+        match_a = self._match(entry_a, 20, 30)
+        match_b = self._match(entry_b, 30, 40)  # starts exactly where A ends
 
-        match = SubContextMatch(entry=entry, query_start=0, query_end=5, source="scanned")
-        plan = plan_prefix_fraction(match, recompute_ratio=0.0)
+        plan_a, plan_b = plan_boundary_recompute_zones([match_a, match_b], k=3)
+
+        # A: leading 3 (First_k(A), always) + trailing 3 (Last_k(A), stitched to B)
+        self.assertEqual(plan_a.recompute_offsets, (0, 1, 2, 7, 8, 9))
+        self.assertEqual(plan_a.reused_ranges(), ((23, 27),))
+        # B: only its own leading 3 -- nothing is stitched after B here.
+        self.assertEqual(plan_b.recompute_offsets, (0, 1, 2))
+        self.assertEqual(plan_b.reused_ranges(), ((33, 40),))
+
+    def test_glue_between_matches_suppresses_last_k(self):
+        """The same two matches, but with a 1-token gap (glue) between
+        them, must NOT trigger match_a's Last_k -- glue is already
+        freshly computed against match_a's true tail, so there is no
+        second boundary to repair on A's side."""
+        entry_a = _make_entry(range(0, 10), orig_position=0)
+        entry_b = _make_entry(range(0, 10), orig_position=100)
+        match_a = self._match(entry_a, 20, 30)
+        match_b = self._match(entry_b, 31, 41)  # position 30 is glue
+
+        plan_a, plan_b = plan_boundary_recompute_zones([match_a, match_b], k=3)
+
+        self.assertEqual(plan_a.recompute_offsets, (0, 1, 2))  # no trailing 7,8,9
+        self.assertEqual(plan_b.recompute_offsets, (0, 1, 2))
+
+    def test_window_larger_than_match_length_is_capped(self):
+        """k exceeding the match's own length must cap at the whole match
+        -- First_k and Last_k overlapping/exceeding the span must not
+        produce out-of-range offsets or a crash."""
+        entry = _make_entry(range(0, 5), orig_position=0)
+        match = self._match(entry, 0, 5)
+        (plan,) = plan_boundary_recompute_zones([match], k=64)
+
+        self.assertEqual(plan.recompute_offsets, (0, 1, 2, 3, 4))
+        self.assertEqual(plan.reused_ranges(), ())
+
+    def test_zero_window_reuses_the_whole_match(self):
+        entry = _make_entry(range(0, 5), orig_position=0)
+        match = self._match(entry, 0, 5)
+        (plan,) = plan_boundary_recompute_zones([match], k=0)
+        self.assertEqual(plan.recompute_offsets, ())
         self.assertEqual(plan.reused_ranges(), ((0, 5),))
+
+    def test_negative_window_is_rejected(self):
+        """k is a token count; negative is meaningless and must fail loud
+        rather than silently produce a garbage range() call. (The spec's
+        {0, 16, 32, 64} enum is enforced separately, at the config surface
+        -- see TestValidBrzWindows below -- since the algorithm itself
+        works for any non-negative k.)"""
+        entry = _make_entry(range(0, 5), orig_position=0)
+        match = self._match(entry, 0, 5)
+        with self.assertRaises(AssertionError):
+            plan_boundary_recompute_zones([match], k=-1)
+
+
+class TestValidBrzWindows(unittest.TestCase):
+    def test_matches_the_cli_choices(self):
+        """Bookkeeping: VALID_BRZ_WINDOWS is what both the CLI's `choices`
+        (arg_groups/fields/memory.py) and the startup check
+        (Scheduler.maybe_init_subcontext_index) validate against -- drift
+        here would let an unsupported k slip past one but not the other."""
+        from sglang.srt.mem_cache.subcontext.deviation_recompute import (
+            VALID_BRZ_WINDOWS,
+        )
+
+        self.assertEqual(VALID_BRZ_WINDOWS, (0, 16, 32, 64))
 
 
 if __name__ == "__main__":
